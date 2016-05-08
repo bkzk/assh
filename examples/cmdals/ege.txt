@@ -1,0 +1,6 @@
+# Example for CMD_ALIAS
+last-hour="`date +%F` `date +%H -d '-1 hour'`"
+yesterday=`date +%F -d "-1 day"`
+today=`date +%F`
+
+exigrep $CMDARG[1] /var/log/exim/mainlog /var/log/exim/mainlog.1 | exigrep $$CMDARG[2]

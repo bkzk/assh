@@ -1,0 +1,2599 @@
+#!/usr/bin/perl
+#                                                                              #
+# asshpm - ncurses based password manager for assh with random passwords       #
+#          generator                                                           #
+#                                                                              #
+#                                                                              #
+# ---------------------------------------------------------------------------  #
+# last modified: 28/04/2016                                                    #
+#                                                                              #
+# written by: Bartosz Kozak <admin@bkzk.net>                                   #
+# **************************************************************************** #
+
+
+use strict;
+use Curses::UI;
+#use Crypt::OpenPGP;
+my $CryptOpenPGP = 'Crypt::OpenPGP';
+use warnings;
+use Data::Dump qw(dump);
+
+##
+#my $cfg_name = 'assh.conf';
+#my @cfg_dirs = ("$ENV{HOME}/.assh2" ,'/etc', '/etc/assh2');
+my $cfg_file = '';
+
+
+##
+my $version  = '1.0beta';
+my $author   = 'Bartosz Kozak <admin@bkzk.net>';
+
+## 
+my %op = ();
+if (@ARGV > 0){
+   use Getopt::Long;
+   GetOptions(
+     'v|version'            => \$op{op_vers},
+     'h|help|?'             => \$op{op_help},
+     # use non-default config file (new todo)
+     'c|config=s'           => \$op{op_fcfg},
+     # use non-default pwdb file 
+     'd|db|passwdb=s'       => \$op{op_pwdb},
+     # be more verbose for testing
+     'g|dbg|debug'          => \$op{op_dbg},
+   );
+}
+######### CONFIG SECTION ##########
+my %cfg = (
+   'passwdb'       => ["$ENV{'HOME'}/.assh/main.gpg"],
+   'color'         => 'on',
+   'pubkey'        => 'off',
+   'recipient'     => '',
+   'recipients'    => '',
+   'cipher_algo'   => 'aes256',
+   'compress_algo' => 'zlib',
+   'dbdir'         => "$ENV{'HOME'}/.assh",
+   'cfg_name'      => 'assh.conf',
+   'cfg_path'      => [ "$ENV{HOME}/.assh",'/etc', '/etc/assh',
+                        "$ENV{HOME}/.assh2",   ],
+#  'sign'          => 'off',
+);
+my $defdir   = $cfg{dbdir};
+###################################
+# if no Crypt::OpenPGP use gpg exec 
+my $gnupg = qx/which gpg/; 
+chomp $gnupg;
+###################################
+
+# ---------------------------------------------------------------------------- #
+# find config file
+# ---------------------------------------------------------------------------- #
+
+
+$cfg_file = &find_cfg(\%cfg);
+
+sub find_cfg {
+
+   my $config = undef;
+   my $cfg_ref = shift;
+
+   foreach (@{ $$cfg_ref{cfg_path}}) {
+      print " checking $_/$$cfg_ref{cfg_name}\n" if defined $op{op_dbg};
+      if (-e "$_/$$cfg_ref{cfg_name}"){
+         print "Config file was found in: $_/$$cfg_ref{cfg_name}\n" if defined $op{op_dbg};
+         $config = "$_/$$cfg_ref{cfg_name}";
+         last;
+      }
+   }
+
+   if (defined $op{op_fcfg}){
+      if (-e $op{op_fcfg}){
+         print "Using non standard config from '$op{op_fcfg}'. \n";# if defined $op{op_dbg} ;
+         $config =  $op{op_fcfg};
+      }
+      else {
+         print "WRR :: No specified config file was found.\n" ; #if defined $op{op_dbg};
+      }
+   }
+   if (defined $config) { return $config; } else {
+      die "ERR :: No config file was found \n!";
+   }
+
+}
+
+print "> Config in use : $cfg_file\n" if defined $op{op_dbg};
+
+# ---------------------------------------------------------------------------- #
+# parse config 
+# ---------------------------------------------------------------------------- #
+
+dump %cfg if defined $op{op_dbg};
+
+if ($cfg_file ne '' ) {
+   &cfg_parse($cfg_file,\%cfg);
+   # replace '~' with $ENV{'HOME'}
+#   if ($cfg{passwdb} =~ /\~/ ) { $cfg{passwdb} =~ s/\~/$ENV{'HOME'}/g; }
+   #if ($cfg{sockdir} =~ /\~/ ) { $cfg{sockdir} =~ s/\~/$ENV{'HOME'}/g; }
+}
+
+dump %cfg if defined $op{op_dbg};
+
+
+#####################################
+
+# file_decrypted - 1 if file was properly decrypted 
+
+my $file_decrypted = 0;
+
+my $hostfile      = $cfg{passwdb}->[0];
+# set color or mono mode 
+my $color         = 1 if $cfg{color} eq 'on';
+# use public key cryptography or symmetric cryptography 
+#my $pubkey        = 1 if $cfg{pubkey} eq 'on';
+#   $pubkey        = 0 if $cfg{pubkey} eq 'off';
+#my $cipher_algo   = $cfg{cipher_algo};
+#my $compress_algo = $cfg{compress_algo}; 
+my $recipient     = $cfg{recipient};
+my @recipients    = split /,/,$cfg{recipients}; 
+
+
+
+dump @recipients if defined $op{op_dbg};
+
+print "pk = $cfg{pubkey}  algo = $cfg{cipher_algo} - comp = $cfg{compress_algo} - recipients $#recipients\n" if defined $op{op_dbg};
+
+
+#####################################
+# check default password file 
+#------------------------------------
+
+if (defined $op{op_pwdb} ) {
+   if (not -e $op{op_pwdb} ){
+       print "ERROR:: Password database file not exist in the specified path !\n";
+       exit 1;
+   }
+   $hostfile = $op{op_pwdb};
+}
+elsif ( not -e $hostfile ) {
+   print "ERROR :: Password database file doesn't exist in the specified path !\n".
+         "         '$hostfile' was not found .\n";
+   exit 1;
+}
+
+print "> Pwdb in use : $hostfile\n" if defined $op{op_dbg};
+
+#################################
+
+
+
+
+
+
+# ---------------------------------------------------------------------------- #
+# parse config file                                                            #
+# ---------------------------------------------------------------------------- #
+sub cfg_parse(){
+    my ($cfgfile,$cfg_ref) = @_;
+
+    if (open CFGFL, $cfgfile){
+       while (<CFGFL>) {
+          chomp;
+          if ($_ !~ /(^#)|(^$)|(^passwd)/){
+             $_ =~ s/ //g;
+             my ($key,$value) = split /=/;
+             $$cfg_ref{"$key"} = $value;
+	     # print "$_\n";
+          }
+          elsif (/^passwd/){
+             my ($key,$value) = split /=/;
+             # clear default passwdb location and use new one from config 
+             @{$$cfg_ref{passwdb}} = ();
+             foreach ( split (/,/,$value) ){
+                s/\~/$ENV{HOME}/;  # replace ~ with home dir
+                s/^\s+|\s+$//g;    # trim right and left whitespaces
+                if (-e "$_") {
+                   print "DB exists: '$_'\n" if $op{op_dbg};
+                   push @{$$cfg_ref{passwdb}},$_;
+                 }
+                 else { print "WRR:: DB not exists: '$_'\n" if $op{op_dbg}; }
+             }
+	     #dump @{$$cfg_ref{passwdb}};
+
+          }
+
+       }
+# dump $cfg_ref;
+#exit 1;
+       close CFGFL;
+    }
+    else {
+       die "ERR :: Config file '$cfgfile' could not be opened properly"; #$!"; 
+    }
+}
+
+# ---------------------------------------------------------------------------- #
+sub prl {
+     my ($no,$ch) = @_; my $line = '';
+     for(my $i=0;$i<= $no;$i++) { $line.="$ch"; }
+     return $line;
+}
+# ---------------------------------------------------------------------------- #
+
+
+# ---------------------------------------------------------------------------- #
+# window declaration 
+# ---------------------------------------------------------------------------- #
+
+my $cui    = new Curses::UI( -color_support => $color, -mouse_support => 1,
+                             -clear_on_exit => 0,);
+my $win_id = '0';
+my %win    = ();
+
+# use symmetric algorithm
+my $symm = '1';
+
+# gpg object declaration 
+#my $gpg;  if ( eval { require Crypt::OpenPGP; 1; } ) {
+my $gpg;  if ( eval { require $CryptOpenPGP; 1; } ) {
+   $gpg = Crypt::OpenPGP->new( Compat => 'GnuPG');
+}
+my @ptpwd = ();
+# others
+my $emptyval = '-- empty field --';
+
+
+# w1 :
+# ----
+
+my @textentry = ();
+my @titlefield = (
+   "Server Alias    :*",
+   "IP / Hostname   :*",
+   "Port            :*",
+   "User Login      :*",
+   "User Password   :*",
+   "User 2 Login    : ",
+   "User 2 Password : ",
+   "Extras          : ",
+);
+
+# w2 :
+# ----
+
+my @textmod = ();
+# my @titlefield  jest zdefiniowana wyzej 
+
+# w4 : 
+# ----
+
+# set global
+my $values = [ ];
+my $labels = {};
+
+# wczytaj aliasy 
+my @aliases = ();
+my $warntitle='ASSHPM WARRNING';
+
+my $val = '';
+my @tmp = ();
+my $curalias='';
+
+$0="asshpm";
+
+
+# ---------------------------------------------------------------------------- #
+#                                  screens                                     #
+# ---------------------------------------------------------------------------- #
+
+
+# ---------------------------------------------------------------------------- #
+# recadd_win()  - adding new record to database on w1 screen 
+# ---------------------------------------------------------------------------- #
+
+
+
+
+### testowow
+
+sub recadd_win {
+
+   #$win{1}->focus;
+   #$win_id = '1';
+
+
+
+   if ($win{$win_id}->getobj('radd_win')){ 
+       $win{$win_id}->delete('radd_win') ; 
+   }
+
+   my $a_win = $win{$win_id}->add( 
+                   'radd_win', 'Window', 
+                    -centered => 1,
+                    #-x      => -2,
+                    -ipad   => 1,
+                    -ipadleft => 3,
+                    -ipadright => 3,
+                    -width  => 80,
+                    -height => 34,
+                    -border => 1,
+                    -bfg    =>  'cyan',
+   );
+   $a_win->add(
+       undef, 'Label',
+          -text => "NEW RECORD (Ctrl+w close window)\n". prl(71,'_') ."\n\n".
+                   "Fields with an asterisk (*) are mandatory. Whitespaces and colons are\n".
+                   "allowed only with  Extra field,  also  whitespaces  can  be used with\n".
+                   "password  but should be avoided. Other fields will be trimmed.\n",
+   );
+   foreach (0 .. 7) {
+      $a_win->add( undef, 'Label', -y => 7+$_*2, -width => 18, -text => "$titlefield[$_]", );
+   }
+
+   foreach (0 .. 6) {
+      $a_win->delete( "f$_" ); 
+      $textentry[$_] = $a_win->add( "f$_", 'TextEntry', 
+       -sbborder => 1, -y => 7+($_*2), -x => 19, -width => 56, );
+   }
+   $a_win->delete( "f7" ); 
+   $textentry[7] = $a_win->add( "f7", 'TextEditor', -vscrollbar => 1,
+    -sbborder => 1, -y => 7+(7*2), -x => 19, -width => 56, -height => 7  );
+   
+
+   $textentry[0]->focus();
+
+   # ---
+
+
+   $a_win->set_binding( \&close_iwin_radd , "\cW");
+   sub close_iwin_radd { 
+      my $win_obj = 'radd_win';
+      if ($win{$win_id}->getobj($win_obj)){
+         $win{$win_id}->delete($win_obj);  
+         &winrecls;
+         $win{$win_id}->focus(); 
+      }
+   }
+
+   $a_win->add(
+       undef, 'Buttonbox',
+       -y => 29, -x => 19,
+       -buttons => [ { -label => "< Accept >", 
+                    -onpress => sub {
+                        # allow ':' in comment field 
+                        my @field; foreach (0 .. 7){
+                             if ($textentry[$_]){
+                                $field[$_] = $textentry[$_]->get();
+                                $field[$_] =~ s/(:)*//g if $_ ne 7;
+                                $field[$_] =~ s/(\s+)*//g if $_ !~ /[764]/;
+                                $field[$_] =~ s/\n//g if $_ eq 7;
+                             }
+                        }
+                        # check first if specified alias exist 
+                        if ( (grep /^$field[0]:/, @ptpwd)){
+                           $cui->dialog( "Record with specified alias already exist.\n".
+                                         " You should choose difrent alias for this record." );
+                        }else {
+
+                           # chceck if (*) was entered
+                           unless ($field[0] and $field[1] and $field[2] and $field[3] and $field[4]) { 
+                              $cui->dialog( -message => "Missing one of required fields !",);  
+                           }
+                           else {
+                              if ( ($field[5] && $field[6] eq '' ) or ($field[6] && $field[5] eq '' )  ) {
+                                  $cui->dialog( -message => "You specified only one of 'User 2 ..' required fields !\n", );
+                              }
+                              else {
+                                 if( $cui->dialog(
+                                     -message => "New record is: '$field[0]:$field[1]:$field[2]:$field[3]:".
+                                                 "$field[4]:$field[5]:$field[6]:$field[7]' ",
+                                     -buttons => ['cancel', 'ok'] ) ){
+                               
+                                      $cui->status("Ok, creating new record .. !"); 
+                                      sleep 1;
+                                      # add record to file 
+                                      push @ptpwd, "$field[0]:$field[1]:$field[2]:$field[3]:".
+                                                   "$field[4]:$field[5]:$field[6]:$field[7]";
+                                      $cui->nostatus;
+                                      foreach (0 .. 6) {
+                                         $a_win->delete( "f$_" ); 
+                                         $textentry[$_] = $a_win->add( "f$_", 'TextEntry',
+                                         -sbborder => 1, -y => 7+($_*2), -x => 19, -width => 56, );
+                                      }
+                                      $a_win->delete( "f7" ); 
+                                      $textentry[7] = $a_win->add( "f7", 'TextEditor', -vscrollbar => 1,
+                                       -sbborder => 1, -y => 7+(7*2), -x => 19, -width => 56, -height => 7  );
+                                      $textentry[0]->focus();
+
+
+                                 }else {
+                                     $cui->status("Canceled. Please correct you record  .. !"); 
+                                     sleep 1; 
+                                     $cui->nostatus;
+                                 }
+                              }#else
+                           }#else
+                        }#else 
+                    }# end_sub
+                  },
+                  { -label => "< Clear >", 
+                    -onpress => sub {
+                        $cui->status(" Clearing fields .. ");
+                        sleep (1);
+#                        foreach (0 .. 7){
+#                          # del current 
+#                          $textentry[$_] = $a_win->delete( "f$_" );
+#                          # add new
+#                          $textentry[$_] = $a_win->add( "f$_", 'TextEntry', 
+#                               -sbborder => 1, -y => 7+($_*2), -x => 19, -width => 20, );
+#                        }
+                         foreach (0 .. 6) {
+                            $a_win->delete( "f$_" ); 
+                            $textentry[$_] = $a_win->add( "f$_", 'TextEntry',
+                             -sbborder => 1, -y => 7+($_*2), -x => 19, -width => 56, );
+                         }
+                         $a_win->delete( "f7" ); 
+                         $textentry[7] = $a_win->add( "f7", 'TextEditor', -vscrollbar => 1,
+                          -sbborder => 1, -y => 7+(7*2), -x => 19, -width => 56, -height => 7  );
+ 
+                        $cui->nostatus;
+                     }
+                  }
+                ]
+   );
+
+}#end recadd_win
+
+
+
+# ---------------------------------------------------------------------------- #
+# recmod_win() - edit existing record on w2 screen 
+# ---------------------------------------------------------------------------- #
+
+sub recmod_win{
+ 
+
+
+   if ($win{$win_id}->getobj('rmod_win')){ 
+       $win{$win_id}->delete('rmod_win') ; 
+   }
+
+   my $m_win = $win{$win_id}->add( 
+                   'rmod_win', 'Window', 
+                    -centered => 1,
+                    #-x      => -2,
+                    -ipad   => 1,
+                    -ipadleft => 3,
+                    -ipadright => 3,
+                    -width  => 80,
+                    -height => 34,
+                    -border => 1,
+                    -bfg    =>  'cyan',
+   );
+   $m_win->set_binding( \&close_iwin_rmod, "\cW");
+     sub close_iwin_rmod {
+         my $win_obj = 'rmod_win';
+         if ($win{$win_id}->getobj($win_obj)){
+           $win{$win_id}->delete($win_obj); 
+           #&winrecls;
+           &reclist_win;
+
+           $win{$win_id}->focus();
+         }
+     }
+
+   $m_win->add(
+       undef, 'Label',
+          -text => "EDIT RECORD (Ctrl+w close window)\n". prl(71,'_') ."\n\n".
+                   "Fields with an asterisk (*) are mandatory. Whitespaces and colons are\n".
+                   "allowed only with  Extra field,  also  whitespaces  can  be used with\n".
+                   "password  but should be avoided. Other fields will be trimmed.\n",
+   );
+
+   foreach (0 .. 7) {
+      $m_win->add( undef, 'Label', -y => 7+$_*2, -width => 18, -text => "$titlefield[$_]", );
+   }
+
+
+   my @rec = @_;
+   #$cui->dialog("Editing :: @rec");
+
+   for (0 .. 7){
+      $rec[$_] = '' if ($rec[$_] eq $emptyval);
+   }
+   foreach (0 .. 6) {
+      $textmod[$_] = $m_win->add( "f$_", 'TextEntry', 
+        -sbborder => 1, -y => 7+($_*2), -x => 19, -width => 56, 
+        -text => "$rec[$_]", -pos => length($rec[$_]),
+      );
+   }
+
+   $textmod[7] = $m_win->add( "f7", 'TextEditor', -vscrollbar => 1,
+     -sbborder => 1, -y => 7+(7*2), -x => 19, -width => 56, -height => 7,
+     -text => "$rec[7]", -pos => length($rec[7]), );
+ 
+
+   $textmod[0]->focus();
+
+   $m_win->add(
+       undef, 'Buttonbox',
+       -y => 29, -x => 19,
+       -buttons => [ { -label => "< Accept >", 
+                    -onpress => sub {
+                        # alllow ':' in comment field 
+                        my @field; foreach (0 .. 7){
+                             if ($textmod[$_]){
+                                $field[$_] = $textmod[$_]->get();
+#                                $field[$_] =~ s/(\s+|:)*//g if $_ ne 7;
+                                $field[$_] =~ s/(:)*//g if $_ ne 7;
+                                $field[$_] =~ s/(\s+)*//g if $_ !~ /[764]/;
+                                $field[$_] =~ s/\n//g if $_ eq 7;
+ 
+                             }
+                        }
+                        # chceck if (*) was entered
+                        unless ($field[0] and $field[1] and $field[2] and $field[3] and $field[4]) { 
+                           $cui->dialog( -message => "Missing one of required fields !",);  
+                        }
+                        else {
+                           if ( ($field[5] && $field[6] eq '' ) or ($field[6] && $field[5] eq '' )  ) {
+                               $cui->dialog( -message => "You specified only one of 'User 2 ..' required fields !\n", );
+                           }
+                           else {
+                              # check any of fields was modified
+                              if ( ($rec[0] ne $field[0]) or ($rec[1] ne $field[1]) or
+                                   ($rec[2] ne $field[2]) or ($rec[3] ne $field[3]) or
+                                   ($rec[4] ne $field[4]) or ($rec[5] ne $field[5]) or 
+                                   ($rec[6] ne $field[6]) or ($rec[7] ne $field[7]))
+                              { 
+                                  #$cui->status( "One or more fields was modified ..." );sleep 1; $cui->nostatus;  
+                              
+                                  if( $cui->dialog(
+                                     -message => "Current record was modifyied. Save it ? \n".
+                                                 "New record is: '$field[0]:$field[1]:$field[2]:$field[3]:".
+                                                 "$field[4]:$field[5]:$field[6]:$field[7]' ",
+                                     -buttons => ['cancel', 'ok'] ) 
+                                    )
+                                  {
+                                     ###
+                                     my $newmodrec = "$field[0]:$field[1]:$field[2]:$field[3]:".
+                                                     "$field[4]:$field[5]:$field[6]:$field[7]";
+                                     #$cui->status( "saving : '$newmodrec' .." ); 
+                                     sleep 1;  
+                                     ### 
+
+                                     # uruchom funkcje i zamien record oraz zapisz do pliku 
+                                     my ($index) = grep { $ptpwd[$_] =~ /^$rec[0]:/ } 0..$#ptpwd; 
+                                     $ptpwd[$index] = $newmodrec ; 
+
+
+                                     # after saving clear textentry
+                                     foreach (0 .. 7) {
+                                        $m_win->delete( "f$_" );
+                                     }
+                                     @rec = (); @field = ();
+                                     #           $cui->nostatus;
+                                     $cui->status( "Record was modified. Press <Ctrl+S> for file saving. \n".
+                                                   "Going to record list screen  .." ); 
+                                     sleep 2;
+                                     $cui->nostatus;
+                                     &close_iwin_rmod;
+
+                                     #$m_win->focus();
+
+
+                                   } else {
+                                      $cui->dialog( "Record not save ." );
+                                   }
+                               }
+                               else {
+                                  $cui->dialog( "You did not mofified any of fields of this record !" );
+                               }
+                           }
+                       }
+                  }
+                  },
+                  { -label => "< Cancel >", 
+                    -onpress => sub {                     
+                        $cui->status("Cancel ! Going to record list screen .. \n"); 
+                        sleep 2;
+                        # wyczysc textentry oraz rec 
+                        foreach (0 .. 7) {
+                           $m_win->delete( "f$_" );
+                        }
+                        @rec = (); 
+
+                        $cui->nostatus;
+                        
+                        #close_intwin();
+
+                        &close_iwin_rmod;
+
+                        #$m_win->focus();
+
+                     }
+                  }
+                ]
+   );
+
+}#
+
+
+
+# ---------------------------------------------------------------------------- #
+# reclis_win() - listing records on w4 screen  
+# ---------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------- #
+# reclis_win() - listing records on w4 screen  
+# ---------------------------------------------------------------------------- #
+
+
+sub reclist_win {
+
+     $win_id = '4';
+     $win{$win_id}->focus();
+
+     #$cui->dialog("record on pdbfile : $#ptpwd ");
+
+     $labels = {};
+     $values = [];
+     @aliases = ();
+
+     if ( $#ptpwd > -1 ){
+
+      #$cui->status("$#ptpwd records was read ");  
+        # wczytaj rekordy z pliku 
+#       if ($#aliases < 0 ){
+
+        for(@ptpwd) {
+           my @tm = split (/:/,$_);
+           push @aliases, $tm[0] if ( $tm[0] !~ /^(--|\s|#)/ ); 
+        }
+        # wpisz rekordy w popupmenu 
+
+        for ( my $v=0; $v <= $#aliases; $v++){
+           push (@$values, $v);
+          @$labels{$v}=$aliases[$v];
+        }
+#      }
+        if ($win{$win_id}->getobj('pop0')){
+           $win{$win_id}->delete('pop0');
+           $win{$win_id}->delete('popupmenulabel');
+           $win{$win_id}->delete('w4lab1');
+           $win{$win_id}->delete('w4lab2');
+        }
+      #$cui->nostatus;
+      my $aliasno = $#aliases+1;
+        $win{4}->add(
+            'w4lab1', 'Label',
+            -text       => "Passwords database : $hostfile\nRecords : [ ".($#aliases+1)." ]\n",
+        );
+        # wstaw popmenu
+        my $popmenu = $win{4}->add(
+           'pop0', 'Popupmenu',
+              -y          => 4,
+              -values     => $values,
+              -labels     => $labels,
+              -width      => 20,
+              -onchange   => sub {
+                 my $pm = shift;
+                 my $lbl = $pm->parent->getobj('popupmenulabel');
+                 # get value no
+                 $val = $pm->get;
+                 $val = "<undef>" unless defined $val;
+                 my $lab = $pm->{-labels}->{$val};
+                 $curalias = $lab;
+                 #####
+                 my $line = prlines(79,'-');
+                 my @record = (grep /^$lab:/,@ptpwd);
+                 chomp (@record);
+                 @tmp = split(/:/, $record[0],8);
+
+                 ($tmp[5])?(1):($tmp[5]=$emptyval);
+                 ($tmp[6])?(1):($tmp[6]=$emptyval);
+                 ($tmp[7])?(1):($tmp[7]=$emptyval);
+
+
+                 # parse last field from password record / comment field
+                 my %hostrec = (); 
+                 get_extra_opts(\%hostrec,$tmp[7]);
+
+                 #my $rec = "\n";
+                 #foreach my $k (keys %{$hostrec{extra}} ){
+                 #   $rec .= "$k : $hostrec{extra}{$k}\n";
+                 #}
+                 my $rec2 = &formatrec(\%hostrec);
+                 if ($rec2 =~ /^$/) { $rec2=": $emptyval\n"; };
+
+                 #print "$line\n";
+                 $val .= ( " [ $lab ] ::\n$line\n\n".
+                    "  Server alias   : $tmp[0]\n".
+                    "  Hostname       : $tmp[1]\n".
+                    "  Port           : $tmp[2]\n".
+                    "  User #1        : $tmp[3]\n".
+                    "  Pswd #1        : $tmp[4]\n".
+                    "  User #2        : $tmp[5]\n".
+                    "  Pswd #2        : $tmp[6]\n".
+#                    "  Extras         : $tmp[7]\n\n".
+#                    "  Extras         : $rec  \n\n".
+                    "  Extras         $rec2\n".
+                    "$line" ) if defined $lab;
+                #####
+                $lbl->text($val);
+                $lbl->draw;
+            },
+       );
+
+       $win{4}->add(
+           'w4lab2', 'Label', -y => 4, -x => 21,
+           -text       => ">>>"
+       );
+
+       $win{4}->add(
+           'popupmenulabel', 'Label',
+           -y => 4, -x => 26, -width => -1, -height => 30,
+           -bold => 1,
+           -text       => "none"
+       );
+       $popmenu->focus();
+
+     }
+     else {
+        $cui->dialog("No records on current passwords database.");
+     }
+
+}#end reclist_win
+# ---------------------------------------------------------------------------- #
+sub ipcheck(){
+
+     my $val_addr =  shift;
+     chomp $val_addr;
+     # use Data::Validate::IP qw(is_ipv4 is_ipv6);
+     if ( eval { require Data::Validate::IP; 1; } ) {
+        if (Data::Validate::IP->new()->is_ipv4($val_addr)){
+           return 1 ; # it is ipv4
+        }
+        else {
+           #print "'$val_addr' :: not an IPv4 ip\n";
+           return 0 ; # it is not an ipv4
+        }
+     }
+     else  {
+        # a little clever way with qr nad scope test 
+        my $rx = qr/^(?!(\.))(\.?(\d{1,3})(?(?{$^N > 255})(*FAIL))){4}$/;
+        if ( $val_addr  =~ $rx ){
+        #if ( $val_addr =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/ ){
+           return 1 ; # it is ipv4
+        }
+        else {
+           return 0 ; # it is not an ipv4
+        }
+     }
+}
+# ---------------------------------------------------------------------------- #
+sub iscidr{
+
+    my $val_addr =  shift;
+    chomp $val_addr;
+
+    if ( $val_addr =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/(\d{1,2})$/ ){
+       if (&ipcheck($1) and ($2 >= 0 && $2 <= 32)){
+          #print "CIDR: $2\n"; 
+          return 1;
+       }
+       else {
+          return 0;
+       }
+    }
+    else {
+       return 0;
+    }
+
+}
+# ---------------------------------------------------------------------------- #
+sub formatrec {
+
+   my $hostrec_ref  = shift;
+   my $str = "\n"; 
+
+   if (defined $$hostrec_ref{extra}){
+      #$str .= sprintf ":%-3s %13s %60s:\n",' ','Extra options',' ';
+      #dump $$hostrec_ref{extra};
+      $str .= sprintf "%-3s %10s %-63s\n" ,
+        ' ', 'PF L:',$$hostrec_ref{extra}{local} if defined $$hostrec_ref{extra}{local};
+      $str .= sprintf "%-3s %10s %-63s\n" ,
+        ' ', 'PF R:',$$hostrec_ref{extra}{remote} if defined $$hostrec_ref{extra}{remote};
+      my $socks = '';
+      $socks = $$hostrec_ref{extra}{socks_bind}.':' if (defined $$hostrec_ref{extra}{socks_bind});
+      $str .= sprintf "%-3s %10s %-63s\n" ,
+        ' ', 'PF D:', $socks . $$hostrec_ref{extra}{socks_port} if defined $$hostrec_ref{extra}{socks_port};
+
+      if (defined $$hostrec_ref{extra}{knock_ports}){
+         $str .= sprintf "%-3s %10s %-63s\n" ,
+           ' ', 'Knock:', join ' ', @{$$hostrec_ref{extra}{knock_ports}};
+      }
+      if (defined $$hostrec_ref{extra}{proxy_host}){
+         my $proxy;
+         $proxy .= $$hostrec_ref{extra}{proxy_type}.'://' if exists $$hostrec_ref{extra}{proxy_type};
+         $proxy .= $$hostrec_ref{extra}{proxy_host} if exists $$hostrec_ref{extra}{proxy_host};
+         $proxy .= ':'.$$hostrec_ref{extra}{proxy_port} if exists $$hostrec_ref{extra}{proxy_port};
+         $str .= sprintf "%-3s %10s %-63s\n" ,' ','Proxy:',$proxy ;
+      }
+      if (defined $$hostrec_ref{extra}{ipv4}){
+
+          my @ipv4_addr;
+          my @ipv4_cidr;
+          foreach my $ipv4 (split /,/, $$hostrec_ref{extra}{ipv4}){
+             $ipv4 =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+             if (&ipcheck($ipv4)){
+                #print " > $ipv4 is IPv4\n";
+                push @ipv4_addr, $ipv4;
+             }
+             elsif(&iscidr($ipv4)){
+                #print " > $ipv4 is IPv4 CIDR \n"; 
+                push @ipv4_cidr, $ipv4;
+             }
+          }
+          $str .= sprintf "%-3s %10s ",' ','IPv4 CIDR:' if scalar @ipv4_cidr;
+          for (my $i=0; $i<=$#ipv4_cidr; ){
+              $str .= sprintf "%-3s %10s ",' ',' ' if( !($i%3) && $i != 0 ) ;
+              $str .= sprintf "%-18s ", $ipv4_cidr[$i++];
+              $str .= sprintf "%-18s ", ($ipv4_cidr[$i])?$ipv4_cidr[$i]:' '; $i++;
+              $str .= sprintf "%-18s ", ($ipv4_cidr[$i])?$ipv4_cidr[$i]:' '; $i++;
+              $str .= sprintf "%6s\n",' ' if( !($i%3) ) ;
+          }
+          $str .= sprintf "%-3s %10s ",' ','IPv4:' if scalar @ipv4_addr;
+          for (my $i=0; $i<=$#ipv4_addr; ){
+              $str .= sprintf "%-3s %10s ",' ',' ' if( !($i%3) && $i != 0 ) ;
+              $str .= sprintf "%-18s ", $ipv4_addr[$i++];
+              $str .= sprintf "%-18s ", ($ipv4_addr[$i])?$ipv4_addr[$i]:' '; $i++;
+              $str .= sprintf "%-18s ", ($ipv4_addr[$i])?$ipv4_addr[$i]:' '; $i++;
+              $str .= sprintf "%6s\n",' ' if( !($i%3) ) ;
+          }
+
+      }
+      if (defined $$hostrec_ref{extra}{ipv6}){
+         my @ipv6 = split /,/, $$hostrec_ref{extra}{ipv6};
+         $str .= sprintf "%-3s %10s ",' ','IPv6:' if scalar @ipv6;
+
+         for (my $i=0; $i<=$#ipv6; ){
+             $str .= sprintf ":%-3s %10s ",' ',' ' if( $i != 0 ) ;
+             $str .= sprintf "%-62s", $ipv6[$i++];
+             $str .= sprintf " \n";
+         }
+      }
+      if (defined $$hostrec_ref{extra}{groups}){
+       $str .= sprintf "%-3s %10s %-63s\n" ,
+           ' ', 'Group:', $$hostrec_ref{extra}{groups}; 
+#join ' ', @{$$hostrec_ref{extra}{groups}};
+         
+
+      }
+      if (defined $$hostrec_ref{extra}{note}){
+         #no-wrap
+         #$str .= sprintf "%-3s %10s ",' ','Note:' ;
+         #$str .= sprintf "%-63s\n" ,' ',$$hostrec_ref{extra}{note} ;
+
+         #wrap
+         my $reclen = length "$$hostrec_ref{extra}{note}";
+         my $s = 0;
+         while ($reclen > 0){
+            $str .= sprintf "%-3s %10s %-63s\n", ' ','Note:',
+                substr "$$hostrec_ref{extra}{note}",$s,63;
+            $reclen -= 63;
+            $s += 63;
+         }
+      }
+   }
+   return $str;
+
+}
+
+# ---------------------------------------------------------------------------- #
+# parse last field from password record / comment field
+# ---------------------------------------------------------------------------- #
+sub get_extra_opts {
+
+         my $hostrec_ref = shift;
+         my $record      = shift;
+
+         if ($record) {
+            #print $record; 
+             my @extra_opt = split /;/, $record;
+             #dump @extra_opt;
+             foreach my $opt (qw/local remote socks knock via proxy ipv4 ipv6 note comment group groups/){
+                print "searching $opt\n" if $op{op_dbg};
+                foreach (@extra_opt) {
+                   if (/^($opt\{(.*)\})$/){
+                      my $val = $2;
+                      #print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                      if ($opt eq 'local'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ( $val =~ /^((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+                             print "local val: ok\n" if $op{op_dbg};
+                             $$hostrec_ref{extra}{local} = $val;
+                         }
+                      }
+                      if ($opt eq 'remote'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ( $val =~ /^((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+                             print "remote val: ok\n" if $op{op_dbg};
+                             $$hostrec_ref{extra}{remote} = $val;
+                         }
+                      }
+                      if ($opt eq 'socks'){
+                         #print " > found: '$opt' - '$1' - '$2' \n";
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ($val =~ /^((.*):)?([0-9]+)$/) {
+                            print "socks val: ok\n" if $op{op_dbg};
+
+                            $$hostrec_ref{extra}{socks_bind} = $2; # || '127.0.0.1';
+                            $$hostrec_ref{extra}{socks_port} = $3;
+                         }
+                      }
+                      if ($opt eq 'knock'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         my @t = split /,/, $val;
+                         #dump @t;
+                         foreach (@t) {
+                            if (/^[0-9]+$/) {
+                               print "knock port: $_ ok\n" if $op{op_dbg};
+                               push @{$$hostrec_ref{extra}{knock_ports}}, $_;
+                            }
+                         }
+                      }
+                      if ($opt =~ /^via|proxy$/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ($val =~ /^(http|socks[45]*):\/\/(.*)/){
+
+                            $$hostrec_ref{extra}{proxy_type} = $1;
+                            my ($hp,$ho,$po) = ($2,undef,undef);
+
+                            print "via: proxy_type = $1, hp = $2 $hp \n" if $op{op_dbg};
+
+                            if ( $hp =~ /(.*):([0-9]+)/ ){
+                               #print "via: $1, $2 , $hp \n";
+                               $ho = $1; $po = $2
+                            }
+                            else {
+                               $ho = $hp ;
+                            }
+                            $$hostrec_ref{extra}{proxy_host} = $ho;
+                            $$hostrec_ref{extra}{proxy_port} = $po if defined $po;
+
+                         }
+                         #if 
+                      }
+                      if ($opt eq 'ipv4'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "local val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{ipv4} = $val;
+                      }
+                      if ($opt eq 'ipv6'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "local val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{ipv6} = $val;
+                      }
+                      if ($opt =~ /^(note|comment)$/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "local val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{note} = $val;
+                      }
+                      if ($opt =~ /^group/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "local val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{groups} = $val;
+                      }
+
+                   }
+                }
+             }
+         }
+}
+# ---------------------------------------------------------------------------- #
+
+
+
+
+
+# ---------------------------------------------------------------------------- #
+# subs from binds/menu
+# ---------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------- #
+# record :: create (w1) 
+# ---------------------------------------------------------------------------- #
+
+sub winrecadd {
+
+
+     if ($win_id =~ /4/) {
+       $cui->status("You are going to create a new assh record .. \n");
+       #sleep 1; 
+       $cui->nostatus;
+
+       if ( $file_decrypted  ){
+          #zly warnuke trzeba sprawdzic czy plik zostal 
+          #
+          recadd_win;
+       }
+       elsif($hostfile eq '') {
+          $cui->dialog("No password database file has been loaded");
+       }
+       else {
+          $cui->dialog("Current database is not new (empty) file and wasn't decrypted.\n".
+                       "Decrypt current file first. Use <Ctrl+P>. ");
+       }
+     }
+
+}
+# ---------------------------------------------------------------------------- #
+# record :: mod (w2) 
+# ---------------------------------------------------------------------------- #
+
+sub winrecmod {
+
+   if ($win_id =~ /4/){
+      if ($val ne ''){
+         if ($cui->error(
+             -message => "Are you sure you want to modify record for  [ $tmp[0] ]\n",
+             -title   => '', #"$warntitle", 
+             -buttons => ['no', 'yes']) 
+            )
+         {
+            #$cui->dialog("Record :: @tmp \n");
+            # ...
+            # ...
+
+            #$win_id='2';
+            $win{$win_id}->focus; 
+            recmod_win(@tmp);
+
+
+         }
+         else {
+            #$cui->dialog("Cancel .... ! \n"); 
+         }
+      } 
+      else {
+         $cui->dialog("No record was selected ! \n");
+      }
+   }
+}
+# ---------------------------------------------------------------------------- #
+# record :: delete (w3)
+# ---------------------------------------------------------------------------- #
+
+sub winrecdel {
+   # record must be select from list first (win 4)
+   if($win_id =~ /4/){
+      if ($val ne ''){
+         if( $cui->error(
+             -message => "You are going to DELETE this record !\n".
+                         "Please confirm your decision\n",
+             -title   => "$warntitle",
+             -buttons => ['no', 'yes'] ) )
+         {
+            $cui->status(-message => "This record is going to be erased !  '$curalias'\n\n".
+                                     "To save changes you must press <Ctrl+S> before exiting.",
+                         -title => $warntitle);
+            # ...
+            # find index of first record that math $curalias
+            my $i = 0; $i++ until ($ptpwd[$i] =~ /^$curalias:/);
+            splice(@ptpwd, $i, 1);
+            sleep 4;
+            # refresh record listing window after 
+            reclist_win;
+            $cui->nostatus;
+         }
+         else {
+            $cui->dialog("Canceling ..  \n");
+         }
+      }
+      else {
+         $cui->dialog("First you must to select some record ! \n");
+      }  
+   }
+}  
+
+# ---------------------------------------------------------------------------- #
+# record :: list (w4) 
+# ---------------------------------------------------------------------------- #
+
+sub winrecls {
+
+     $cui->status("Listing records ... \n");
+     sleep (0.5); 
+     $cui->nostatus;
+
+     $win_id='4';
+     $win{$win_id}->focus;
+
+     reclist_win;
+}
+
+# ---------------------------------------------------------------------------- #
+# record :: find (w4) 
+# ---------------------------------------------------------------------------- #
+
+sub winrecfind {
+
+no warnings 'uninitialized';
+
+     my $sval = $cui->question( -question => 'Find records :');
+     my $founds = '';
+     
+
+     
+     if ($sval) {
+        $cui->status("Searching record '$sval'... \n");
+        
+        my @records = (grep /$sval/, @ptpwd);
+        chomp (@records);
+
+        if ( $#records > -1 ){
+           for (my $i = '0'; $i <= $#records; $i++){
+                my @recspl = split(/:/, $records[$i],8);
+                ($recspl[5])?(1):($recspl[5]=$emptyval);
+                ($recspl[6])?(1):($recspl[6]=$emptyval);
+                ($recspl[7])?(1):($recspl[7]=$emptyval);
+                #print "$line\n";
+                $founds .= ( "\n-- [ $recspl[0] ] -- \n\n".
+                    "  Server alias   : $recspl[0]\n".
+                    "  Hostname       : $recspl[1]\n".
+                    "  Port           : $recspl[2]\n".
+                    "  User #1        : $recspl[3]\n".
+                    "  Pswd #1        : $recspl[4]\n". 
+                    "  User #2        : $recspl[5]\n".
+                    "  Pass #2        : $recspl[6]\n".
+                    "  Extras         : $recspl[7]\n".
+                    "\n" );
+           }
+
+           my $obj=$win{$win_id}->getobj('viewer');
+           if($obj) {                                                                                                  
+             $win{$win_id}->delete('viewer');
+           }                                                                                
+           my $viewer = $win{$win_id}->add(
+              'viewer', 'TextViewer',
+              -text  => "Records found: ". ($#records+1) ." \n $founds",
+              -pad   => '6',
+              -border => '1',
+           );
+           $viewer->focus();
+           $viewer->set_binding( \&closewrf , "q");
+             sub closewrf{ 
+                 if ($win{$win_id}->delete('viewer')){
+                    $win{$win_id}->delete('viewer'); $win{$win_id}->focus(); 
+                    #$cui->clear_binding( '__routine_'.\&closewrf );
+                 }
+             }
+        }else {
+        #   $founds = "No record was found.";
+            $cui->nostatus;
+            $cui->status("No record was found.");
+            sleep(1);
+        }
+
+        sleep (1);
+        $cui->nostatus;
+     }
+ 
+
+}############## TO DO ###########################################
+
+# ---------------------------------------------------------------------------- #
+# confirm your exit
+# ---------------------------------------------------------------------------- #
+
+sub exit_dialog(){
+     my $return = $cui->dialog(
+        -message   => "Do you really want to quit?",
+        -title     => "Are you sure???", 
+        -buttons   => ['yes', 'no'],
+        -bfg       => 'cyan',#'green',
+     );
+     exit(0) if $return;
+}
+
+# ---------------------------------------------------------------------------- #
+# print lines
+# ---------------------------------------------------------------------------- #
+
+sub prlines{
+   my ($n,$ch) = @_; my $line = '';
+   for (my $i=1; $i<=$n;$i++ ){ $line.="$ch";} 
+   return $line;
+}
+
+# ---------------------------------------------------------------------------- #
+
+
+
+
+
+# ---------------------------------------------------------------------------- #
+# OpenPGP functions
+# ---------------------------------------------------------------------------- #
+
+
+
+# ---------------------------------------------------------------------------- #
+# prompt fo passphrase : use w0 screen 
+# ---------------------------------------------------------------------------- #
+
+sub passprompt{
+
+      my $xcrpt     = $_[0];
+      my $altfile   = $_[1];
+      my $pshr      = '';
+      my $passentry = '';
+
+      # sprawdz czy baza jest juz zaladowana 
+      if ( $xcrpt eq 'd' && $#ptpwd > -1 ){ 
+         $cui->dialog("Passwords database seems to be loaded already.");
+         $win_id ='4';
+         $win{$win_id}->focus();
+
+      }
+      elsif ( $xcrpt eq 'e' && "$#ptpwd" eq '-1' ){
+         $cui->dialog("Passwords database is empty - nothing to encrypt.");
+         $win_id ='4';
+         $win{$win_id}->focus();
+
+      }
+      elsif ($hostfile eq '' ){
+         $cui->dialog("No password databases was specified.");
+      
+      }
+      else {
+
+
+
+      $win_id = '0';
+      $win{$win_id}->focus;
+
+  if ($cfg{pubkey} =~ /yes|on|true|1/i  and $xcrpt eq 'e' ) {
+     #$cui->dialog("   [Using public key]     \n");
+     # polacz rekordy z tablicy w skalar   
+     my $npt = ''; 
+     $hostfile = $altfile if defined $altfile;
+ 
+     foreach (@ptpwd) {  $npt .= "$_\n"; }
+     pdbencrypt( $npt ,$hostfile, '' );
+  
+     $win_id= '4';
+     $win{$win_id}->focus();
+  }
+  else {
+
+      my $h = $win{$win_id}->parentwindow();
+      my $hval = $h->height();
+      my $wval = $h->width();
+      my $hcenter = $hval/2-5;
+      my $wcenter = $wval/2-20;
+
+      if ($win{$win_id}->getobj('pl0') ) {
+         $win{$win_id}->delete('pl0');
+         $win{$win_id}->delete('pe0');
+         $win{$win_id}->delete('pb0');
+      }
+      $win{$win_id}->add(
+         'pl0', 'Label', -y => $hcenter, -x => $wcenter, 
+         -text => "Enter passphrase:",
+         -width => 20, 
+         -sbborde => 1,
+      );
+      $passentry = $win{$win_id}->add(
+         'pe0', 'PasswordEntry',
+         -y => $hcenter,
+         -x => $wcenter+20,
+         -width => 20,
+      );
+
+      $passentry->focus();
+
+      $win{$win_id}->add( 
+          'pb0', 'Buttonbox',
+          -y => $hcenter +2, -x => $wcenter+20 ,
+          -buttons => [ { -label => "< Accept >",
+                          -onpress => sub {  
+                             if ($pshr = $passentry->get()){ 
+                                 # decrypting 
+                                 if ($xcrpt eq 'd'){
+                                    if(my $pt = pdbdecrypt($hostfile,$pshr)){
+                                       # insert password db records into ptpwd array 
+                                       @ptpwd = split (/\n/, $pt);
+                                       $win{$win_id}->delete('pl0');
+                                       $win{$win_id}->delete('pe0');
+                                       $win{$win_id}->delete('pb0');
+                                       # clear passphrase val
+                                       $pshr = '' ;
+                                       #$cui->status("[ ".($#ptpwd+1)." ] lines was read ..\n Press <Ctrl+L> for listing ..");
+                                       $cui->status(" Passwords database was loaded .. ");
+                                       reclist_win;
+                                       sleep 1;
+                                       # clear plaintext val
+                                       $pt = '';
+
+                                       # -----
+                                       sub recsyntax{
+                                           foreach (@ptpwd){
+                                              # ignore checking lines which starts with '#' or '--'
+                                              if ( $_ !~ /^(#|--)/ ) {
+                                                 #alias:hostname:port:iser1:pass1:user2:pass2:dcorcommment
+                                                 if ( $_ =~ m/\S+:\S+:\d+:\S+:\S+:.*:.*:.*/ ) {
+                                                    #$cui->status("Syntax ok >> $_"); 
+                                                 }else {
+                                                    $cui->dialog("Syntax error : '$_'");
+                                                 }
+                                              }
+                                           }
+                                           #$cui->nostatus;
+                                       }; recsyntax; 
+                                       # -----
+                                   
+                                   }
+                                   else {
+                                       $cui->status("Error: Bad passphrase.\n");
+                                       $cui->nostatus;
+                                   }
+                                }
+                                # encrypting
+                                if ($xcrpt eq 'e'){
+
+                                   $win{$win_id}->delete('pl0');
+                                   $win{$win_id}->delete('pe0');
+                                   $win{$win_id}->delete('pb0');
+
+                                   $win{$win_id}->add(
+                                      'pl0', 'Label', -y => $hcenter, -x => $wcenter-1, 
+                                      -text => "Repeat passphrase:",
+                                      -width => 20, -sbborde => 1,
+                                   );
+
+                                   my $passentry2 = $win{$win_id}->add(
+                                      'pe0', 'PasswordEntry',
+                                      -y => $hcenter,-x => $wcenter+20, -width => 20,
+                                   );
+                                   $passentry2->focus();
+
+                                   $win{$win_id}->add( 
+                                       'pb1', 'Buttonbox',
+                                       -y => $hcenter +2, -x => $wcenter+20 ,
+                                       -buttons => [ 
+                                       { -label => "< Accept >",
+                                         -onpress => sub {  
+                                            my $pshr2 = $passentry2->get();
+
+                                            if ($pshr eq $pshr2){
+                                                my $npt = '';
+                                                # polacz rekordy z tablicy w skalar    
+                                                foreach (@ptpwd) {  $npt .= "$_\n"; }
+                                                if (defined $altfile) {
+                                                   pdbencrypt( $npt ,$altfile, $pshr );
+                                                } else {
+                                                   pdbencrypt( $npt ,$hostfile, $pshr );
+                                                }
+                                                $win{$win_id}->delete('pl0');
+                                                $win{$win_id}->delete('pe0');
+                                                $win{$win_id}->delete('pb0');
+                                                $win{$win_id}->delete('pb1');
+                                                # clear passphrase val
+                                                $pshr  = '';
+                                                $pshr2 = '';
+                                            }
+                                            else {
+                                                $win{$win_id}->delete('pl0');
+                                                $win{$win_id}->delete('pe0');
+                                                $win{$win_id}->delete('pb0');
+                                                $win{$win_id}->delete('pb1');
+                                                $cui->status("Incorrect passphrases. Press <Ctrl+S> for saving.\n"); 
+                                                sleep 2; 
+                                                # clear passphrase val
+                                                $pshr  = '';
+                                                
+                                                $pshr2 = '';
+                                                $cui->nostatus;
+                           
+                                           }
+                                           $win_id= '4';
+                                           $win{$win_id}->focus();
+                                           #sleep 1;
+
+                                       }},
+                                       { -label => "< Reset >",
+                                         -onpress => sub {
+                                            $win{$win_id}->delete('pe0');
+                                            $passentry2 = $win{$win_id}->add(
+                                             'pe0', 'PasswordEntry',
+                                             -y => $hcenter,-x => $wcenter+20, -width => 20,
+                                            );
+                                            $passentry2->focus();
+                                       },
+                                     }]);
+
+                                }
+                            
+                             }
+                          },
+                        },
+                        { -label => "< Reset >",
+                          -onpress => sub {
+                             $win{$win_id}->delete('pe0');
+                             $passentry = $win{$win_id}->add(
+                               'pe0', 'PasswordEntry',
+                               -sbborder => 1,
+                               -y => $hcenter,
+                               -x => $wcenter+20,
+                               -width => 20,
+                             ); 
+                             $passentry->focus();
+                          },
+                        }
+                     ]
+     )
+  }#if pubbkey;
+
+     }# else
+
+
+
+}
+
+# ---------------------------------------------------------------------------- #
+# decrypt password database file using gpg object 
+# ---------------------------------------------------------------------------- #
+
+sub pdbdecrypt{
+
+    my $cfile = $_[0];
+    my $sec = $_[1];
+    my $pt= '';
+
+    if ( eval { require $CryptOpenPGP; 1; }  ) {
+       unless ($pt) {
+          $pt = $gpg->decrypt(
+                   Filename   => $cfile,
+                   #PassphraseCallback => \&passprompt,
+                   Passphrase => $sec,
+          );
+          unless ($pt) {
+             if ($gpg->errstr =~ /Bad checksum/) {
+                #print "Error: Bad passphrase.\n\n";
+                #die "Error: Bad passphrase.\n\n";
+                $cui->status("Error: Bad passphrase.\n");
+                sleep 1; 
+                $cui->nostatus;
+             } 
+             else {
+                my $gpgerrstr = $gpg->errstr;
+                chomp $gpgerrstr;
+                `echo "$gpgerrstr" > error`;
+                if (-z $cfile) { $gpgerrstr = 'File exists but has zero size' ;}
+                $cui->error(-message => "Error: '$gpgerrstr' ") if defined $gpgerrstr;
+             }
+          }
+          else { 
+             $cui->status("Passphrase correct.\n");
+             sleep 1;
+             undef $sec; undef $_[1];
+             # set status 
+             $file_decrypted = 1;
+             $cui->nostatus;
+          }
+       }
+       return $pt;
+    }
+    else {
+       unless ($pt){
+          # jesli nie posiadasz wymaganego liba z bibliotek cpan 
+          # sproboj recznie 
+          use IPC::Open3;
+          #my $gnupg = 'gpg'; 
+
+
+          local (*HIS_IN, *HIS_OUT, *HIS_ERR);
+          my $cmd = "$gnupg --batch -q --passphrase-fd 0 --decrypt $cfile";
+          my $pid = open3(*HIS_IN, *HIS_OUT, *HIS_ERR, $cmd);
+          print HIS_IN "$sec\n";
+          close(HIS_IN);
+          my @gpgout = <HIS_OUT>;
+          my @gpgerr = <HIS_ERR>;
+
+          #print "STDOUT:\n", @outlines, "\n";
+          #print "STDERR:\n", @errlines, "\n";
+
+          close HIS_OUT;
+          close HIS_ERR;
+
+          waitpid( $pid, 0); 
+          if ($?) {
+             if (@gpgerr) {
+                # $cui->error(-message => "Error: @gpgerr " ) ;
+                $cui->status("Error: Bad passphrase.\n");
+                sleep 1; 
+                $cui->nostatus;
+             }
+          }
+          elsif (@gpgout) {
+             #print "gpgout: lines".  $#gpgout ."\n";
+             $pt = join ('', @gpgout);
+             $file_decrypted = 1;
+          }
+       }
+       return $pt;
+    }
+
+}
+
+# ---------------------------------------------------------------------------- #
+# pdbencrypt ( DATA , <OUTFILE> , passphrase);
+# ---------------------------------------------------------------------------- #
+
+sub pdbencrypt {
+
+    my $pt = $_[0];
+    my $cfile = $_[1];
+    my $sec = $_[2];
+
+    #####################################################################
+    my %enc_args;
+    if ($cfg{pubkey} =~ /yes|on|true|1/i ) {
+       # work with public keys
+       # %enc_args = ( Recipients => $recips,
+       #               RecipientsCallback => $cb );
+
+#       $cui->status("   Using Public Key ...  $cfg{recipient} , $#recipients, @recipients,".scalar @recipients ."\n");
+       $cui->status("   Using Public Key ... \n");
+       sleep 1;
+
+       if (scalar @recipients) {
+          $cui->status("   Multiple recipients [@recipients]   \n");
+          sleep 1;
+          %enc_args = (
+              Recipients => \@recipients,
+              #Compress   => $cfg{compress_algo},
+           );
+       }
+       else {
+          $cui->status("   Single recipient [$cfg{recipient}]   \n");
+          sleep 1;
+          %enc_args = (
+              Recipients => $cfg{recipient},
+              #Compress   => $cfg{compress_algo},
+          );
+       }
+
+    } 
+    else {
+       # compat = gnupg oznacza :
+       # Encryption: symmetric cipher = Rijndael, 
+       #             compression = Zlib, 
+       #             modification detection code (MDC) = 1
+       # Signing: digest = RIPE-MD/160, packet format = version 4
+       $cui->status("   Using Symmetric Algorithms ...  \n");
+       sleep 1;
+       # for Crypt::Openpgp aes == Rijndael 
+       if ( eval { require $CryptOpenPGP; 1; } ) {
+          if ($cfg{cipher_algo} =~ /aes/i) { 
+             $cfg{cipher_algo} =~ s/aes/Rijndael/i; 
+          }
+       }
+       %enc_args = ( 
+            #Compat   => 'GnuPG',
+            Cipher     => $cfg{cipher_algo},
+            Compress   => $cfg{compress_algo},
+            MDC        => 1,
+            Passphrase => $sec, 
+       );
+    }
+    #####################################################################
+    # encrypt
+    #####################################################################
+
+    my $gpgerrstr; 
+    my $ct;
+
+    if ( eval { require $CryptOpenPGP; 1; } ) {
+       $ct = $gpg->encrypt(
+              %enc_args,
+              Data     => $pt,
+       ) or $gpgerrstr=$gpg->errstr;
+       if ($gpgerrstr){
+          $cui->error(-message => "$gpgerrstr" ) 
+       } 
+       else {
+          $cui->status("Encrypting successful.  \n"); 
+          sleep 1;
+          #undef $_[2] if not $pubkey;
+          undef $_[2] if not $cfg{pubkey} =~ /yes|on|true|1/i;;
+       }
+    }
+    else { 
+       # solution import from gpgwrapper package 
+       #http://www.perlmonks.org/bare/?node_id=72208
+       use IPC::Open3;
+       local (*HIS_IN, *HIS_OUT, *HIS_ERR);
+       use IO::File;
+       use POSIX qw(tmpnam);
+
+       my $hackname;
+       my $fh;
+       do { $hackname = tmpnam(); }
+       until $fh = IO::File->new($hackname, O_RDWR | O_CREAT | O_EXCL);
+       binmode($fh); 
+       # zapisz plaintext do handlera
+       print $fh $pt;
+       close $fh;
+
+       my $cmd = '';
+       if ($cfg{pubkey} =~ /yes|on|true|1/i) {
+
+	  my $rcpt_args;
+	  if (scalar @recipients ){
+	     $rcpt_args = join " -r ", @recipients;
+	  } 
+	  elsif ($cfg{recipient}) {
+	     $rcpt_args = $cfg{recipient};
+	  }
+
+	  $cui->status("Recipient(s): $rcpt_args \n");
+	  sleep 2;
+
+	  $cmd = "$gnupg --batch -q -r $rcpt_args -e -o - ";
+
+	  sleep 3;
+#          die "TODO";
+       } 
+       else { 
+          $cmd = "$gnupg --batch -q --passphrase-fd 0 --compress-algo $enc_args{Compress} --cipher-algo $enc_args{Cipher} --symmetric -o - $hackname"; 
+       } 
+       my $chpid = open3(*HIS_IN, *HIS_OUT, *HIS_ERR, $cmd);
+       if ($cfg{pubkey} =~ /yes|on|true|1/i ) {
+
+          print HIS_IN $pt;
+          close(HIS_IN);
+
+       }
+       else {
+          print HIS_IN "$enc_args{Passphrase}\n";
+          close(HIS_IN);
+       }
+       my @gpgout = <HIS_OUT>;
+       my @gpgerr = <HIS_ERR>;
+
+       close HIS_OUT;
+       close HIS_ERR;
+
+       waitpid( $chpid, 0); 
+       if ($?) {
+          if (@gpgerr) {
+              $cui->error(-message => "Error: @gpgerr " ) ;
+          }   
+       }
+       elsif (@gpgout) {
+          #print "gpgout: lines".  $#gpgout ."\n";
+          #print "@gpgout\n";
+          $ct = join ('',@gpgout);
+       }  
+    }
+    #####################################################################
+    # jesli szyfrowanie sie powiodlo zrzuc do pliku wynik 
+    if ($ct){
+       use Fcntl;
+       sysopen(CTFL, "$cfile", O_WRONLY|O_CREAT|O_TRUNC, 0600) or
+          $cui->error(-message => "Could not open or create file $cfile !");
+       print CTFL $ct; 
+       close (CTFL);
+    }
+    $cui->nostatus;
+
+}
+
+
+
+# ---------------------------------------------------------------------------- #
+#                             MENU EXTRA FUNCION
+# ---------------------------------------------------------------------------- #
+
+
+# ---------------------------------------------------------------------------- #
+# sshsocklist - list open ssh sockets
+# ---------------------------------------------------------------------------- #
+
+sub sshsocklist{
+
+     my $n = $_[0];
+     my $sshlist = " SSH Connection Stats: \n\n".
+                   " STATE   PID     UID/USER    LPORT   FOREIGN ADDR.                  ".
+                   " TTY        ETIME         STIME       TIMER\n\n";
+
+     my $nopt = '-tpeo';
+     $nopt='-tpneo' if $n eq 'n';
+
+     open( SS, "/bin/netstat $nopt 2>/dev/null | ") or my $sserror=$!;
+            $cui->dialog ("ERROR: $sserror") if defined $sserror; 
+     my @ss = <SS>;
+     close(SS);
+
+     foreach ( grep /ssh/, @ss ) { 
+        my @sl = split /\s+/, $_ ;
+        chomp (@sl);
+        my @pid = split /\//, $sl[8];
+        open( PS, "/bin/ps -p $pid[0] -o etime= -o stime= -o tty= 2>/dev/null | ") or my $pserror=$!;
+         $cui->dialog ("ERROR: $pserror") if defined $pserror;
+         my @ps = split /\s+/, <PS>;
+         chomp (@ps);
+        close (PS);
+        $sl[3] = (split(/:/,$sl[3]))[1];
+        $sshlist .= sprintf ( " %-7s %-7s %-10s  %-6s  %-30s  %-8s   %-12s  %-10s  %s \n", 
+                               (substr($sl[5],0,5)), $pid[0], $sl[6], $sl[3], $sl[4], 
+                               $ps[3], $ps[1], $ps[2], $sl[9]
+                            );
+
+     }
+
+     my $obj=$win{$win_id}->getobj('sshviewer');
+     if($obj) {                                                                                                  
+        $win{$win_id}->delete('sshviewer');
+     }                                                                                
+     my $viewer = $win{$win_id}->add(
+          'sshviewer', 'TextViewer',
+          -text   => "$sshlist",
+          -pad    => '6',
+          -border => '1',
+          -fg     => 'cyan',
+          -bfg    => 'blue',
+     );
+     $viewer->focus();
+
+     $viewer->set_binding( \&closesshv, "q");
+       sub closesshv { 
+           if ($win{$win_id}->getobj('sshviewer')){
+             $win{$win_id}->delete('sshviewer'); $win{$win_id}->focus(); 
+             #$cui->clear_binding( '__routine_'.\&closesshv );
+           }
+        }
+     $viewer->set_binding( sub{sshsocklist('r');}  , "r");
+     $viewer->set_binding( sub{sshsocklist('n');}  , "n");
+
+
+}
+# ---------------------------------------------------------------------------- #
+# winrecsetti() - password generator win
+# ---------------------------------------------------------------------------- #
+
+sub winrecsetti {
+
+     if ($win{$win_id}->getobj('settiwin')){ 
+        $win{$win_id}->delete('settiwin') ; 
+     }
+
+     my $iwin = $win{$win_id}->add( 
+                   'settiwin', 'Window', 
+                    -centered => 1,
+                    #-y      =>  1, 
+                    #-x      => -2,
+                    -ipad   => 1, 
+                    -width  => 80,
+                    -height => 20,
+                    -border => 1,
+                    -bfg    => 'cyan',
+     );
+     my $mlval = ['s','a', ];
+     my $mllab = {  's' => 'Symmetric encryption',
+                    'a' => 'Public Key encryption', 
+                 };
+
+     $iwin->add(
+        'lbl1', 'Label',
+        -text => 'Encryption Settings ',
+     );
+     my $listbox =  $iwin->add(
+        'ml1', 'Listbox',
+        -padtop     => 2,
+        -values     => $mlval,
+        -labels     => $mllab,
+        -width      => 36,
+        -height     => 4,
+        -border     => 0,
+        -radio      => 1,
+#        -selected   => [ $$mllab{'s'}  ] ,
+        -selected   => ($cfg{pubkey} =~ /yes|on|true|1/i)?1:0 ,
+     );
+
+     $iwin->add(
+        'gpglab', 'Label', -padtop  => 5,
+        -text => '    GPG PUBKEY ID:',
+     );
+     my $gpgidentry = $iwin->add( "gpgid", 'TextEntry', 
+       -sbborder => 1, -padtop => 5 , -x => 20, -width => 16,
+       -text => (defined $cfg{recipient})?$cfg{recipient}:'' ,
+       -ipadleft => 1, -ipadright => 1,
+     );
+   
+     #$pwlentry->focus();
+
+     $iwin->add( 
+          'pb1', 'Buttonbox',
+          -padtop => 15,
+          -buttons => [ { -label => "| Save |",
+                          -onpress => sub { 
+
+                              my $selc = $listbox->get();
+
+                              if ($selc eq 'a') {
+                                 $cfg{pubkey} = 'on';
+                                  my $gpgid = $gpgidentry->get;
+                                  $gpgid =~ s/^\s+|\s+$//;
+                                  #$cui->dialog("'$gpgid' , '$gpgidentry->get' ");
+                                  if ( $gpgid ne '' ) {
+                                     $cfg{recipient} = $gpgid; 
+                                  }
+ 
+                              }elsif ($selc eq 's') { 
+                                 $cfg{pubkey} = 'off';
+                              }
+                           
+                              if ( $cfg{recipient} eq '' && $cfg{pubkey} =~ /yes|on|true|1/i ) {
+                                 $cui->dialog( -message => "Missing public key ID !",
+                                               -title => " Settings not saved ");
+                              }
+                              else {
+                                 $cui->status("Saving settings:\n\n".
+                                              " Encryption method: " . 
+                                    (($cfg{pubkey} =~ /yes|on|true|1/i)?"public key\n":"symmetric\n").
+                                    (($cfg{pubkey} =~ /yes|on|true|1/i)?" GPG PUBKEY ID: ". $cfg{recipient}."\n":''),
+                                 ); 
+                                 sleep 3;
+                                 $cui->nostatus;  
+
+                              }
+
+                          },
+                        }, 
+                        { -label => "| Quit |",
+                          -onpress => sub {
+                              $win{$win_id}->delete('settiwin');
+                              $win{$win_id}->focus();
+                          },
+                        },
+                      ],
+      );
+      $iwin->focus();
+                     
+
+}
+
+
+
+# ---------------------------------------------------------------------------- #
+# winrecgpass() - password generator win
+# ---------------------------------------------------------------------------- #
+
+sub winrecgpass {
+
+     if ($win{$win_id}->getobj('pswin')){ 
+        $win{$win_id}->delete('pswin') ; 
+     }
+
+     my $iwin = $win{$win_id}->add( 
+                   'pswin', 'Window', 
+                    -centered => 1,
+                    #-y      =>  1, 
+                    #-x      => -2,
+                    -ipad   => 1, 
+                    -width  => 80,
+                    -height => 20,
+                    -border => 1,
+                    -bfg    =>  'cyan',
+     );
+     my $mlval = ['u','l','d','w','n','m','s' ];
+     my $mllab = {  'u' => 'Uppercase',
+                    'l' => 'Lowercase', 
+                    'd' => 'Numbers',
+                    'w' => 'White spaces',
+                    'n' => 'Underline',
+                    'm' => 'Minus',
+                    's' => 'Special characters',
+                 };
+
+     $iwin->add(
+        'lbl1', 'Label',
+        -text => 'URandom Passwords Generator ',
+     );
+
+     my $listbox =  $iwin->add(
+        'ml1', 'Listbox',
+        -padtop     => 2,
+        -values     => $mlval,
+        -labels     => $mllab,
+        -width      => 26,
+        -height     => 10,
+        -border     => 0,
+        -multi      => 1,
+#        -selected   => [ ${$mllab}{'u'}  ] ,
+     );
+
+     $iwin->add(
+        'pwllab', 'Label', -padtop  => 10, 
+        -text => 'Length (10):',
+     );
+     my $pwlentry = $iwin->add( "pwl", 'TextEntry', 
+       -sbborder => 1, -padtop => 10 , -x => 15, -width => 10,
+       -regexp  => '/^\d*$/' ,
+     );
+   
+     #$pwlentry->focus();
+
+
+     $iwin->add( 
+          'pb1', 'Buttonbox',
+          -padtop => 15,
+          -buttons => [ { -label => "| Generate |",
+                          -onpress => sub { 
+                              my @selc = $listbox->get();
+                              my $pwl  = $pwlentry->get();
+                              $pwl = '12' unless( $pwl );
+
+                              my $fil = join ('',@selc);
+                              my $passlist = genpass($fil,$pwl);
+                              if ($iwin->getobj('lbl2')){
+                                 $iwin->delete('lbl2');
+                              }
+                              my $passlbl = $iwin->add(
+                                 'lbl2', 'Label', -padtop => 1, -x => 37, -width => 38,
+                                 -border => 1,  -ipad => 1, -ipadbottom => 0,#-reverse => 1,
+                                 -text => $passlist, ) if defined $passlist;
+                              $passlbl->focus();
+                          },
+                        }, 
+                        { -label => "| Quit |",
+                          -onpress => sub {
+                              $win{$win_id}->delete('pswin');
+                              $win{$win_id}->focus();
+                          },
+                        },
+                      ],
+      );
+      $iwin->focus();
+                     
+
+}
+
+# ---------------------------------------------------------------------------- #
+# genpass -  generate random passwords 
+# ---------------------------------------------------------------------------- #
+
+sub genpass {
+
+   my $gpass = '';
+   my $fil = $_[0];
+   my $RANDEV = '/dev/urandom';
+   my $PWL = $_[1];
+   my $PEX = '7';
+
+   my $entropy = '';
+   my $ptentr  = '';
+ 
+   my ($nbyte ,$mbyte, $eno);
+   my ($upper, $lower, $digit) = (0, 0, 0);
+   my ($minus, $uline, $wspace, $spchar) = (0, 0, 0, 0);
+   my $alpha = 1 ;
+
+
+     $upper  = 1 if (grep /u/, $fil);
+     $lower  = 1 if (grep /l/, $fil);
+     $digit  = 1 if (grep /d/, $fil);
+     $wspace = 1 if (grep /w/, $fil);
+     $uline  = 1 if (grep /n/, $fil);
+     $minus  = 1 if (grep /m/, $fil);
+     $spchar = 1 if (grep /s/, $fil);
+     $alpha  = 0 if (grep /u|l|d|s/, $fil);
+     $alpha  = 1 if (grep /a/, $fil);
+
+     open DEVRANDOM, $RANDEV or die "$0: open: $!";
+     while (($nbyte = read DEVRANDOM, $entropy, 1) != 0) {
+          $entropy =~ s/[^[:print:]]//g;
+          $ptentr .= $entropy;
+          $eno = length($ptentr);
+          $mbyte+=$nbyte;
+          last if $eno eq 1000*$PWL;
+     }
+     close (DEVRANDOM);
+
+     $ptentr =~ s/[~`!@#\$\%^&*()+=,.<>{}\]\[\'\"\\\/:;?|]//g if $spchar == 0;
+     $ptentr =~ s/\s//g if $wspace == 0;
+     $ptentr =~ s/_//g  if $uline  == 0;
+     $ptentr =~ s/-//g  if $minus  == 0;
+     $ptentr =~ s/\d//g if $digit == 0;
+     $ptentr =~ s/[a-z]//g if $lower == 0;
+     $ptentr =~ s/[A-Z]//g if $upper == 0;
+
+     while ($PEX--) {
+        for (my $i = 0; $i < $PWL; $i++){
+            $gpass .= (substr($ptentr, rand(length($ptentr))-1 , 1) );
+        }
+        $gpass .= "\n" ;
+     }
+     return $gpass;
+
+
+
+}
+
+# ---------------------------------------------------------------------------- #
+# 
+# ---------------------------------------------------------------------------- #
+
+sub winabout {
+
+
+     if ($win{$win_id}->getobj('pswin')){ 
+        $win{$win_id}->delete('pswin') ; 
+     }
+
+     my $iwin = $win{$win_id}->add(
+                   'pswin', 'Window',
+                    -centered => 1,
+                    -ipad   => 1,
+                    -width  => 100,
+                    -height => 100,
+                    -border => 1,
+                    -bfg    =>  'cyan',
+     );
+     my $info ='';
+     if ($_[0] eq 'a'){
+        $info = <<"EOF_INFO";
+ASSHPM - ASSH PASSWORD MANAGER
+
+ASSHPM is a password manager written for managing passwords database files for assh (version 2).
+ASSH was written to automate the process of logging on to servers that  do not allow direct root
+login. ASSH uses gpg-agent to store passphrase for database password file. Thanks to  this there
+is no need to enter this passphrase every time you want to connect remotely to the  server. Once
+you enter the passphrase it is kept by gpg-agent in memory for a certain period of time.
+
+ASSHPM allows for easy management of database password. It can also be used to store any type of
+passwords but the  records will be stored  in a specified  format.  There is  also useful random 
+passwords generator, and simple monitor connection.
+
+(c) by Bartosz Kozak <admin\@bkzk.net>
+EOF_INFO
+
+
+
+     }
+     if ($_[0] eq 'l'){
+        $info = <<"EOF_LINE";
+License:
+
+ Copyright (C)  2011-2016   Bartosz Kozak                                     
+                                                                              
+ This program is free software: you can redistribute it and/or modify         
+ it under the terms of the GNU General Public License as published by         
+ the Free Software Foundation, either version 2 of the License, or            
+ (at your option) any later version.                                          
+                                                                              
+ This program is distributed in the hope that it will be useful,              
+ but WITHOUT ANY WARRANTY; without even the implied warranty of               
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                
+ GNU General Public License for more details.                                 
+                                                                              
+ You should have received a copy of the GNU General Public License            
+ along with this program.  If not, see <http://www.gnu.org/licenses/>.        
+
+EOF_LINE
+
+     }
+     if ($_[0] eq 'h'){
+        $info = <<EOF_LINE; 
+Help:
+
+After any changes remember to save file before quiting. 
+Use Save option from menu or <Ctrl+S> .
+
+SSH Connection Scrren
+    r                Refresh ssh connection screen.
+    n                Refresh ssh connection screen, 
+                     show numerical addresses instead of hostname.
+    q                Close non-interactive internal windows
+
+Shortcuts:
+    Ctrl + X          Show menu
+	 Ctrl + Q          Quit.
+    Ctrl + W          Close interactive internal windows. 
+    Ctrl + P          Run manually passprompt screen for newly opened 
+                      passwords database files (decrypt)
+    Ctrl + S          Save changes, encrypt current file.
+    Ctrl + Z          Save as .. .
+	
+    Ctrl + L          List all records .
+    Ctrl + A          Add new record. 
+    Ctrl + E          Edit current record..	
+    Ctrl + R          Delete current record.	
+    Ctrl + F          Search records by alias, ip addresses or comments
+    Ctrl + U          Clear textentry field.
+    q                 Close non-interactive internal windows
+
+EOF_LINE
+
+	
+     }    
+
+     $iwin->add(
+        'about', 'Label',
+        -text => $info ,
+     );
+
+     $iwin->focus();
+     $iwin->set_binding( sub {   
+        $win{$win_id}->delete('pswin');
+   	$win{$win_id}->focus();   
+     } , "q");
+
+}
+
+
+# ---------------------------------------------------------------------------- #
+#                                FILE MANEGEMENT
+# ---------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------- #
+# closedb() - close file 
+# ---------------------------------------------------------------------------- #
+
+sub closepdb {
+
+     my @curpdb = split(/\//, $hostfile);
+
+     if ( $hostfile ){
+
+        my $ans =  $cui->dialog(
+             -message => "Are you sure to close current database '$curpdb[$#curpdb]' ?\n",
+             -title   => "Closing passwords database ..", -buttons => ['no', 'yes']);
+        if( $ans )
+        {
+           # clearing records and hostfile 
+           $cui->status( -width => 50, -message => "Closing selected database .. \n$hostfile");
+
+           $hostfile       = ''; 
+           @ptpwd          = ();
+           # clearing popupmenu values 
+           $val            = '';
+           $values         = [ ];
+           $labels         = {};
+           @aliases        = ();
+           $val            = '';
+           @tmp            = ();
+           # 
+           $file_decrypted = 0;
+   
+           if ($win{$win_id}->getobj('pop0')){
+              $win{$win_id}->delete('pop0');
+              $win{$win_id}->delete('popupmenulabel'); 
+              $win{$win_id}->delete('w4lab1');
+              $win{$win_id}->delete('w4lab2');
+           }
+
+           sleep 1; 
+           $cui->nostatus;
+           # change file name on footer
+           win0pdbname();
+        }
+        else { return 0; }
+     }
+     else {# nothing to close  
+        return 1; 
+     }
+
+}
+
+# ---------------------------------------------------------------------------- #
+# opendb - open file
+# ---------------------------------------------------------------------------- #
+sub openpdb {
+     my $file = $cui->loadfilebrowser(
+                      -title => "Select some file", -width => 200,
+                       -mask  => [
+                         ['.',      'All files (*)'      ],
+                         ['\.gpg$', 'GPG files (*.gpg)' ],
+                       ],
+                       -show_hidden => 1, 
+                       -path => $defdir,
+                );
+     if (defined $file){
+
+        if (not -z $file) {
+           # check
+           # now clear previously open database
+           if ( &closepdb) {
+              $cui->status( -width => 50, -message => "Loading selected database .. \n$file");
+              # 
+              $hostfile = $file; 
+              # wszytaj baze z pliku 
+              passprompt('d'); 
+              # change pdb file name in status bar
+              win0pdbname();
+              sleep 1;
+              $cui->nostatus;	
+           }
+        }
+        else {
+           $cui->dialog("This file '$file' is empty. Try to open existing database."); 
+        }
+
+     }
+
+}
+# ---------------------------------------------------------------------------- #
+# createpdb() - create new password database file
+# ---------------------------------------------------------------------------- #
+
+sub createpdb {
+      
+     my $file = $cui->question( 
+         -title => "Create in $defdir/..", 
+         -question => 'Enter filename :                      ');
+
+     if (defined $file){
+
+        # check if file name is not a path /
+        if ($file =~ /\//){
+           $cui->dialog("Path directories are not allowed in file name.\n".
+                        "Files are stored in the : $defdir");
+        }
+     else {
+        unless ( -e "$defdir/$file" ){
+          # close current pdb 
+          if ( &closepdb ){
+             if ( sysopen(CTFLTMP, "$defdir/$file", O_CREAT, 0600) ) {
+
+             close (CTFLTMP);
+             # set hostfile to new file
+             $hostfile = "$defdir/$file";
+             # change passwdb file name in footer
+             win0pdbname();
+             $cui->status("New password database will be store in:\n".
+                          "$defdir/$file\n".
+                          "\nPress <Ctrl+A> to add new record.".
+                          "\nPress <Ctrl+S> to save changes." );
+
+
+             # unblock adding and saving files
+             $file_decrypted = 1;
+
+             sleep 5;
+             $cui->nostatus;           
+             # change to list screen
+             $win_id = '4';
+             $win{$win_id}->focus();
+             # open internal window for new records
+             &winrecadd;
+
+
+             }
+             else {  
+                $cui->error(-message => "Could not create: $defdir/$file !\n");
+             }
+          }else { $cui->status("Cancaling .."); sleep 1; $cui->nostatus;  }
+
+        }else {
+            $cui->dialog("Current filename already exist.\n".
+                         "Please choose a different one. ") ;
+
+        }  
+     }
+     }
+     else {
+        #$cui->dialog("Missing filename !") ;
+           
+     }
+}
+
+# ---------------------------------------------------------------------------- #
+# saves() - save current database as a diffrent file 
+# ---------------------------------------------------------------------------- #
+
+sub saveas {
+
+     if ($hostfile) {
+     my $file = $cui->savefilebrowser(
+                      -title => "Select some file", 
+                      -width => 200,
+                      -show_hidden => 1, 
+                      -path => $defdir,
+                );
+     if (defined $file){
+        $cui->dialog("You selected the file:\n$file"); 
+        # encrypt 
+        passprompt('e',$file); 
+
+     }
+     }
+
+}
+# -----------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------- #
+# MAIN 
+# ---------------------------------------------------------------------------- #
+
+
+############################### WIN CONSTRUCTION ###############################
+
+# menu
+#
+my @menu = (
+   { -label   => 'File      ', 
+     -submenu => [ 
+                   { -label => 'New   ...         ', -value => \&createpdb  },
+                   { -label => 'Open  ...         ', -value => \&openpdb    },
+                   { -label => 'Close ...         ', -value => \&closepdb   },
+
+                   { -label => ' ---------------- ', },
+                   { -label => 'Save            ^S', -value => sub {passprompt('e'); }   },
+                   { -label => 'Save as...      ^Z', -value => \&saveas   },
+                   { -label => ' ---------------- ', },
+                   { -label => 'Exit            ^Q', -value => \&exit_dialog },
+                 ]
+   },
+   { -label   => 'Records     ',
+     -submenu => [
+                   { -label => 'Passwords generator ', -value => \&winrecgpass },
+                   { -label => 'Encryption settings ', -value => \&winrecsetti },
+                   { -label => ' ------------------ ', },
+                   { -label => 'New               ^A', -value => \&winrecadd  },
+                   { -label => 'Delete            ^R', -value => \&winrecdel  },
+                   { -label => 'Modify            ^E', -value => \&winrecmod  },
+                   { -label => ' ------------------ ', },
+                   { -label => 'Search            ^F', -value => \&winrecfind  },
+                   { -label => 'List              ^L', -value => \&winrecls   },
+
+
+
+                 ]
+   },
+   { -label   => 'Connections  ',
+     -submenu => [
+                   { -label => 'SSH Monitor      ', -value => \&sshsocklist  },
+                 ]
+
+   },
+   { -label   => 'About     ',
+    -submenu => [     
+                   { -label => 'Authors     ', -value => sub { winabout('a'); } },
+                   { -label => 'License     ', -value => sub { winabout('l'); } },
+                   { -label => 'Help        ', -value => sub { winabout('h'); } },
+                ]
+   },
+);
+# insert menu on screen 
+my $menu = $cui->add( 'menu', 'Menubar', -menu => \@menu, -bg  => "cyan", -fg => "black", );
+
+# Create the explanation window
+
+my $win0 = $cui->add(
+   'win0', 'Window',
+   -border        => 1,
+   -y             => -1,
+   -height        => 2,
+   -bfg           => 'blue',
+);
+
+
+
+
+sub term_size(){
+     my ($wt, $ht) ;
+     if ( eval { require Term::ReadKey; Term::ReadKey->import(); 1; } ) {
+        ($wt, $ht) = GetTerminalSize();
+        #print "TR: $wt - $ht\n";
+     }
+     else {
+        my @st = split(/;/, (qx(stty -a))[0]);
+        ($ht,$wt) = ( (split / /,$st[1])[2], (split / /,$st[2])[2] );
+        #print "ST: $wt - $ht \n";
+     }
+     return ($ht,$wt);
+}; #term_size;
+my ($y,$x) = term_size();
+
+local $SIG{'WINCH'} = sub { 
+  ($y,$x) = &term_size(); 
+  &ts_warn;  
+};
+
+my $h = $win0->parentwindow();
+my $wval = $h->width();
+my $hval = $win0->height();
+my $wcenter = $wval/2;
+
+
+sub ts_warn {
+  if ($x < 109 || $y < 53) {
+     if ($win0->getobj('explain')) { 
+        $win0->delete('explain'); 
+     };
+        $win0->add('explain', 'Label',
+         -text => "ASSH (C) by bkzk. Ctrl+X: menu,   \n",
+         -text => "Warning! Minimum terminal size required is 109x53 ! Current:  $x x $y   \n",
+         -fg => 'red',
+     );
+  } 
+  else {
+     if ($win0->getobj('explain')) { 
+        $win0->delete('explain'); 
+     };
+     $win0->add('explain', 'Label',
+      -text => "ASSH (C) by bkzk. Term size: $x x $y . Ctrl+x: menu, Ctrl+q: quit \n",
+     );
+  }
+  $win{$win_id}->focus() if $win{$win_id}; 
+}
+
+ts_warn;
+
+#$win0->add('explain', 'Label',
+#  -text => "ASSH (C) by bkzk. Term size: $x x $y . Ctrl+x: menu, Ctrl+q: quit \n",
+#);
+
+
+sub win0pdbname {
+
+  
+     my @curpdb = '' ; @curpdb = split(/\//, $hostfile) if $hostfile;
+     $curpdb[$#curpdb] = 'none' unless $hostfile  ;
+
+     if ($win0->getobj('pwddb')) {
+        $win0->delete('pwddb');
+     }
+     $win0->add('pwddb', 'Label',
+        -textalignment => 'right',
+        -text => "PDB: $curpdb[$#curpdb]" ,
+        -x => -1 , 
+     );
+     #$win0->focus();
+     $win{$win_id}->focus();
+
+};
+
+
+# -----------------------------------------------------------------------------
+# Create  windows
+# -----------------------------------------------------------------------------
+
+my %screens = (
+    '0'  => 'Passphrase ..',
+    '1'  => 'Creating new record    ..',
+    '2'  => 'Modifying record  ..',
+    '3'  => 'Removing record ..',
+    '4'  => 'Listing records ..',
+);
+
+my @screens = sort {$a<=>$b} keys %screens;
+
+my %args = (
+    -border       => 1,
+    -titlereverse => 0,
+    -padtop       => 2,
+    -padbottom    => 4,
+    -ipad         => 1,
+    -bfg          => 'blue',
+);
+
+while (my ($nr, $title) = each %screens)
+{
+    my $id = "window_$nr";
+    $win{$nr} = $cui->add(
+        $id, 'Window',
+        -title => "ASSH Passwords Manager: $title",
+        %args
+    );
+}
+
+# -----------------------------------------------------------------------------
+# screen settings
+# set variables for screen and static widgets 
+
+
+# w0 : welcome screen ---------------------------------------------------------
+
+     $win{0}->add(
+        undef, 'Label',
+           -text => "\n",
+     );
+
+
+     sub set_w0 {
+        $win_id = '0';
+        $win{$win_id}->focus();
+
+        passprompt('d'); 
+     }
+
+# w1 :  screen add --------------------------------------------------------
+
+# przniesione do wewnetrznego okna 
+
+#     $win{1}->add(
+#        undef, 'Label',
+#          -text => "Please complete all necessary fields (*) in the form below,\n".
+#                   "whitespace and colon (:) are not allowed and will be removed\n".
+#                   "from fields in case of use ..\n\n",
+#     );
+#
+#     foreach (0 .. 7) {
+#        $win{1}->add( undef, 'Label', -y => 8+$_*2, -width => 18, -text => "$titlefield[$_]", );
+#     }
+
+# w2 : modify screen -----------------------------------------------------------
+
+#     $win{2}->add(
+#        undef, 'Label',
+#          -text => "You are going to modify this record.\n".
+#                   "...\n\n",
+#     );
+    
+#     foreach (0 .. 7) {
+#        $win{2}->add( undef, 'Label', -y => 8+$_*2, -width => 18, -text => "$titlefield[$_]", );
+#     }
+
+
+# ------------------------------------------------------------------------------
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Setup bindings and focus 
+# -----------------------------------------------------------------------------
+
+
+$cui->set_binding(sub {$menu->focus()}, "\cX");
+
+$cui->set_binding( \&exit_dialog , "\cQ");
+$cui->set_binding( \&winrecls,   "\cL");
+$cui->set_binding( \&winrecmod,  "\cE");
+$cui->set_binding( \&winrecadd,  "\cA");
+$cui->set_binding( \&winrecdel,  "\cR");
+$cui->set_binding( \&winrecfind, "\cF");
+$cui->set_binding( \&winiddd, "\cM");
+  sub winiddd{
+      $cui->status("Current win: $win_id");sleep 1 ; $cui->nostatus;
+  }
+$cui->set_binding( 
+   sub { 
+      $cui->status("Current passwdb in use : $hostfile"); 
+      sleep 2; $cui->nostatus;  
+   } , "\cK");
+
+# for test - identify window number 
+$cui->set_binding( \&set_w0, "\cP");
+
+# save changes
+$cui->set_binding( sub { passprompt('e'); }, "\cS");
+# save changes as...
+$cui->set_binding( \&saveas, "\cZ");
+
+
+# run screen 0 at startup
+
+set_w0;
+win0pdbname;
+
+#$win_id = '0';
+#$win{$win_id}->focus;
+
+
+# -----------------------------------------------------------------------------
+# Run Mainloop ..
+# -----------------------------------------------------------------------------
+
+$cui->mainloop();
+
+
+#__EOF__

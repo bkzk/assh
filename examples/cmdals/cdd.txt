@@ -1,0 +1,18 @@
+# assh example.com cdd 
+#      ^           ^
+#    host_alias   cmd_alias
+
+
+if [ -z "$CMDARG[1]" ]; then 
+   if [ -n "$(awk '/^$CMDARG[0]:/' /etc/virtual/domainowners)" ]; then
+      cd /home/`awk '/^$CMDARG[0]:/ {print $2}' /etc/virtual/domainowners`/domains/$CMDARG[0];
+   else 
+     echo "No such domain '$CMDARG[0]'";
+   fi
+else
+   if [ -n "$(awk '/^$CMDARG[1]:/' /etc/virtual/domainowners)" ]; then
+     cd /home/`awk '/^$CMDARG[1]:/ {print $2}' /etc/virtual/domainowners`/domains/$CMDARG[1];
+   else
+     echo "No such domain '$CMDARG[1]'";
+   fi
+fi 

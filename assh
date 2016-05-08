@@ -1,0 +1,5130 @@
+#!/usr/bin/perl
+#                                                                             #
+# aSSH version 3 - automated ssh                                              #
+#                                                                             #
+# ASSH automate the login  process  to  servers.  It uses gpg-agent to  store #
+# passphrase  to  password  database file. Thanks to GnuGPG agent there is no #
+# need  to  enter  this  passphrase  and  passwords to servers every time you #
+# connect remotely to the server. Once you enter the passphrase it is kept by #
+# gpg-agent in memory  for a certain period  of  time. This tool allow you to #
+# remotely login to servers without asking for a password, execute command on #
+# single or multiple servers. It also supports some of OpenSSH  features like #
+# port forwarding or proxy connection and others like port knocking.          #
+#                                                                             #
+#                                                                             #
+# --------------------------------------------------------------------------- #
+# Licence:                                                                    #
+# --------------------------------------------------------------------------- #
+#                                                                             #
+# Copyright (C)  2011-2016   Bartosz Kozak                                    #
+#                                                                             #
+# This program is free software: you can redistribute it and/or modify        #
+# it under the terms of the GNU General Public License as published by        #
+# the Free Software Foundation, either version 2 of the License, or           #
+# (at your option) any later version.                                         #
+#                                                                             #
+# This program is distributed in the hope that it will be useful,             #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of              #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the               #
+# GNU General Public License for more details.                                #
+#                                                                             #
+# You should have received a copy of the GNU General Public License           #
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.       #
+#                                                                             #
+#                                                                             #
+# --------------------------------------------------------------------------- #
+# Requiments:                                                                 #
+# --------------------------------------------------------------------------- #
+#                                                                             #
+# Tools: gpg2, gpg-agent, pinentry, openssh, netcat-openbsd, curl, perl-doc   #
+# CPAN modules:                                                               #
+#                                                                             #
+# cpan -i Net::OpenSSH \                                                      #
+#        Expect \                                                             #
+#        IO::Pty IO::Tty IO::Stty \                                           #
+#        Digest::MD5 \                                                        #
+#        Term::ReadKey \                                                      #
+#        Term::ANSIColor \                                                    #
+#        Getopt::Complete  \                                                  #
+#        Net::CIDR \                                                          #
+#        Data::Validate::IP \                                                 #
+#        Data::Validate::Domain                                               #
+#                                                                             #
+# Debian:                                                                     #
+#    apt-get install gnupg2 gnupg-agent pinentry-curses pinentry-gtk2         #
+#    apt-get install curl netcat-openbsd perl-doc                             #
+#    :: cpan libs ::                                                          #
+#    apt-get -y install libio-stty-perl libio-stty-perl libexpect-perl \      #
+#        libio-pty-perl libnet-openssh-compat-perl libnet-openssh-perl \      #
+#        libnet-sftp-foreign-perl libnet-cidr-perl libgetopt-complete-perl    #
+#    apt-get -y install libcurses-ui-perl libterm-readkey-perl                #
+#                                                                             #
+# Slackware:                                                                  #
+#   slackpkg install gnupg2 pinentry curl                                     #
+#   sbopkg -i netcat-openbsd cpan2tgz                                         #
+#   cpan2tgz  IO:Pty IO:Tty IO:Stty Expect Net:OpenSSH Digest::MD5 \          #
+#             Getopt::Complete Term::ANSIColor Term::ReadKey Net::CIDR \      #
+#             Data::Validate::IP Data::Validate::Domain                       #
+#                                                                             #
+# --------------------------------------------------------------------------- #
+#                                                                             #
+# Last modification: 05/05/2016                                               #
+#                                                                             #
+# --------------------------------------------------------------------------- #
+#                                                                             #
+# 2011/12/25 written by  Bartosz Kozak  <admin@bkzk.net>                      #
+#                                                                             #
+#******************************************************************************
+
+BEGIN {
+   require Getopt::Complete ;
+   #$Getopt::Complete::LONE_DASH = 0;
+   $Getopt::Complete::EXIT_ON_ERRORS = 0;
+}
+
+use strict;
+use warnings;
+use feature "switch";
+use Net::OpenSSH;
+use Expect;
+use Digest::MD5;
+use Term::ANSIColor qw(:constants);
+use Pod::Usage;
+
+#my $cfg_name = 'assh.conf';
+#my @cfg_dirs = ("$ENV{HOME}/.assh2",'/etc', '/etc/assh2');
+my $cfg_file = '';
+
+# const
+my $version  = '3.3.1beta';
+my $author   = 'Bartosz Kozak <admin@bkzk.net>';
+my $footer   = 'connected with ASSH3 (C) --';
+my $sleeptime= '1';
+
+# !!! do not edit this hash, use your configuration file 
+sub cfg_defval {
+
+   return  (
+     'exec_gpg2'      => &find_cmd('gpg2'),         # qx/which gpg2/,      # 'gpg2',
+     'exec_gpgagent'  => &find_cmd('gpg-agent'),    # qx/which gpg-agent/, # 'gpg-agent',
+     'exec_pinentry'  => &find_cmd('pinentry'),     # qx/which pinentry/,  # 'pinentry',
+     'exec_pm'        => &find_cmd('asshpm'),
+     'exec_nc'        => &find_cmd('nc.openbsd'),
+     'exec_corkscrew' => &find_cmd('corkscrew'),
+     'exec_ssh'       => &find_cmd('ssh'),
+     'exec_scp'       => &find_cmd('scp'),
+     'exec_sshkeygen' => &find_cmd('ssh-keygen'),
+     'exec_curl'      => &find_cmd('curl'),
+#   'exec_scdaemon'  => &find_cmd('scdaemon'),
+     'exec_scdaemon'  => '/usr/libexec/scdaemon',
+     # pinentry user interface [-curses | -gtk-2 | -qt | -qt4 ]
+     'pinui'          => '-curses',
+     'agentttl'       => '3660',
+     'dbdir'          => "$ENV{'HOME'}/.assh",
+     'logdir'         => "$ENV{'HOME'}/.assh/logs",
+     'sockdir'        => "$ENV{'HOME'}/.assh/sockets",
+     'passwdb'        => ["$ENV{'HOME'}/.assh/main.gpg"],
+     #'passphrase'     => 'e6fe99feac5c8535123d5490a8226d15',
+     'passphrase'     => '',
+     'color'          => 'on',
+     'tooltips'       => 'on',
+     'pubkey'         => 'off',
+     'recipient'      => '',
+     'recipients'     => '',
+     'cipher_algo'    => 'aes256',
+     'compress_algo'  => 'Zlib',
+     #new  
+     'suenv'          => 'on',
+     'proxy'          => 'off',
+     'proxy_url'      => '',
+     'proxy_default'  => 'cli',,
+     'cfg_name'       => 'assh.conf',
+     'cfg_path'       => [ "$ENV{HOME}/.assh",'/etc', '/etc/assh',
+                           "$ENV{HOME}/.assh2",   ],
+     #additional 
+     'username'       => $ENV{USER} || (getpwuid($<))[0],
+     'scsupport'      => 'off',
+     'useruid'        => $<,
+     'usergid'        => (getpwuid($<))[3],
+     'kssh_verb'      => 0,
+
+   );
+}
+
+my %cfg =  cfg_defval();
+my %cli ;
+# =======
+my %proxy_port = (
+   'socks5' => '1080',
+   'socks4' => '1080',
+   'socks'  => '1080',
+   'http'   => '3128',
+   'https'  => '3128',
+);
+
+
+# ---------------------------------------------------------------------------- #
+
+# GetOptions returns true to indicate success. It returns false when the 
+# function detected one or more errors during option parsing. These errors 
+# are signalled using warn() and can be trapped with $SIG{__WARN__} .
+# http://perldoc.perl.org/Getopt/Long.html
+local $SIG{__WARN__} = sub { die $_[0] };
+
+## copy ARGV  
+my @argv_cp = @ARGV;
+my @xcmds; 
+my %op = ();
+if (@ARGV > 0){
+   use Getopt::Long qw(:config no_ignore_case);
+   GetOptions(
+     'v|version'            => \$op{op_vers},
+     'h|help|?'             => \$op{op_help},
+     # show config
+     'settings'             => \$op{op_cfgset},
+     # use non-default config file 
+     'c|config=s'           => \$op{op_fcfg},
+     # use non-default pwdb file 
+     'd|db|database|passwdb=s@'      => \$op{op_pwdb},
+     # auto login with user anvironment (like with su -)
+     'l|login=s'            => \$op{op_autl},
+     # run in parallel mode or serial mode
+     'p|pssh|parallel|s|sssh|serial=s'    => \$op{op_pssh},
+     # execute remote commands
+     'e|exec=s'             => \$op{op_exec},
+     # print decoded record from passwdb 
+     'dec|decode'           => \$op{op_dec},
+     # edit records from passwdb with asshpm  
+     'm|manager'            => \$op{op_pm},
+     # defined comands
+     #'x=i' => \$op{op_cmdx},
+     'x=i'                  => \@xcmds,
+     'xls|xcmd'             => \$op{op_xls},
+     # export bash variable for xterm title (ugly hack) 
+     # echo 'PS1="\[\e]0;[\h]\a\]$PS1"'
+     't|set-title'          => \$op{op_xterm},
+     # be more verbose, useful for tests 
+     'dbg|debug'            => \$op{op_dbg},
+  # NOWE 
+     'man|manual'           => \$op{op_man},
+     # run in parallel mode (be carefull with this)
+     # execute remote commands from file
+     'ef|exec-file=s'       => \$op{op_fexec},
+     '1|nosu|no-su'         => \$op{op_nosu},       # -1 
+     '2|suuser'             => \$op{op_suuser},       # -1 
+     'nologout|no-logout|stay' => \$op{op_nologout},
+     # via diffrent type of proxy 
+     'via|via-proxy:s{,1}'  => \$op{op_vproxy}, 
+     'via-http:s{,1}'       => \$op{op_vhttp},  
+     'via-socks:s{,1}'      => \$op{op_vsocks}, 
+     'list-proxy|lp'        => \$op{op_lproxy}, 
+     'no-proxy|no-via'      => \$op{op_noproxy}, 
+     # port-forwarding
+     'L|pf-local:s{,1}'     => \$op{op_pfloc},
+     'R|pf-remote:s{,1}'    => \$op{op_pfrem},
+     'D|pf-dynamic|socks:s{,1}'  => \$op{op_socks},       
+     'list-socks|ls'        => \$op{op_lsocks},
+     'w|vpn|tun=s'          => \$op{op_tun},
+     'list-pf|lpf'          => \$op{op_lspf},
+     # port-knocking
+     'k|knock|kssk:s{,1}'   => \$op{op_kssh},
+     # log session input 
+     'logsession'           => \$op{op_slog},        
+     # db import/export
+     'import:s{,1}'         => \$op{op_dbimp},
+     'import-keys|keys=s'   => \$op{op_dbimpkeys},
+     'export'               => \$op{op_dbexp},
+     # search restrictions
+     'aliases'              => \$op{op_aliases},
+     'hosts'                => \$op{op_hosts},
+     'run-local'            => \$op{op_rlocal},
+     'fpr'                  => \$op{op_finger},
+     'no-wrap'              => \$op{op_nowrap},
+     'wrap'                 => \$op{op_wrap},
+     'no-fork'              => \$op{op_nofork},
+     'knock-only|ko'        => \$op{op_knocker},
+     'g|group|groups:s{,1}' => \$op{op_groups},
+     'q|quiet'               => \$op{op_quiet},
+# todo
+#     'X' => \$op{op_xfrwd},
+#     'Y' => \$op{op_yfrwd},
+#     'xy' => \$op{op_xfrwd},
+
+   );
+}
+
+#print "'$op{op_socks}'" if defined $op{op_socks} ; exit;
+
+my $op_args = '[-]{1,2}(v|version|h|help|c|cfg|config|f|file-config|d|db|passwdb|l|login|p|pssh|parallel|e|exec|g|dbg|debug|dec|decode|t|set-title|m|manager|x|xls|xcmd|s|sssh|serial|ef|exec-file|1|nosu|no-su|2|suuser|nologout|no-logout|stay|via|via-proxy|via-socks|via-http|list-proxy|no-proxy|no-via|socks|list-socks|knock|kssh|k|logsession|import|import-keys|keys|export|man|manual|aliases|hosts|pf-local|pf-remote|pf-dynamic|L|R|D|run-local|fpr|no-wrap|wrap|no-fork|knock-only|ko|g|group|groups|q|quiet)';
+
+
+
+#pod2usage(1) if $op{op_help};
+pod2usage(-exitval => 0, -verbose => 2) if $op{op_man};
+
+#if ($SIG{__WARN__}) { print "WARN" ;exit; }
+
+
+# ---------------------------------------------------------------------------- #
+
+# lines width 
+my ($LU,$LD) = (79, 51); 
+$0='assh';
+
+# ---------------------------------------------------------------------------- #
+# find config file                                                             #
+# ---------------------------------------------------------------------------- #
+
+$cfg_file = &find_cfg(\%cfg);
+
+sub find_cfg {
+
+   my $config = undef; 
+   my $cfg_ref = shift;
+
+   foreach (@{ $$cfg_ref{cfg_path}}) {
+      print " checking $_/$$cfg_ref{cfg_name}\n" if defined $op{op_dbg};
+      if (-e "$_/$$cfg_ref{cfg_name}"){
+         print "Config file was found in: $_/$$cfg_ref{cfg_name}\n" if defined $op{op_dbg};
+         $config = "$_/$$cfg_ref{cfg_name}";
+         last;
+      }
+   }
+
+   if (defined $op{op_fcfg}){
+      if (-e $op{op_fcfg}){
+         print "Using non standard config from '$op{op_fcfg}'. \n";# if defined $op{op_dbg} ;
+         $config =  $op{op_fcfg};
+      } 
+      else {
+         print "WRR :: No specified config file was found.\n" ; #if defined $op{op_dbg};
+      }
+   }
+   if (defined $config) { return $config; } else {
+      die "ERR :: No config file was found \n!";
+   }
+
+}
+
+## show config for dbg
+if (defined $op{op_dbg}){
+   if ( eval { require Data::Dump; 1; } ) {
+      use warnings;
+      use Data::Dump qw(dump);
+      ## config file parse and set 
+      print "> Config: $cfg{cfg_name} - dirs : @{$cfg{cfg_path}} \n";
+      print "> Config in use : $cfg_file\n";
+      dump \%cfg if defined $op{op_dbg};
+   }
+   else {
+      print "Missing Data::Dump module for dbg.\n"; 
+      exit 1; 
+   }
+}
+
+## parse config 
+if ($cfg_file ne '' ) {
+   &cfg_parse($cfg_file,\%cfg);
+}
+
+dump \%cfg if defined $op{op_dbg};
+
+## check if pinentry ui exists
+if ( -e $cfg{exec_pinentry}.$cfg{pinui}  ) {
+   print ">  ".$cfg{exec_pinentry}.$cfg{pinui}." was found ...  \n" if defined $op{op_dbg};
+}
+else {
+   print "ERR: Passphrase manager '".$cfg{exec_pinentry}.$cfg{pinui}."' does not exist!\n".
+         "Try to set diffrent pinentry ui. \n" ;
+   foreach (qw(gpg2 gpg-agent pinentry)){
+      print " * Found in system: &find_cmd($_) . $/" ;
+   }
+}
+
+# color defaults , do not edit this here, use config file
+my @CL = ('RESET' ,'BLUE', 'BOLD GREEN', 'RED', 'BOLD GREEN', 'WHITE');
+   @CL = ('','','','','','')  if $cfg{color} eq 'off';
+
+# ---------------------------------------------------------------------------- #
+#dump @xcmds; 
+
+if (defined $op{op_xls} ){
+   print "Commands set in config:\n";
+   foreach my $k (sort keys %cfg) {
+      if ($k =~ /^cmd|^defcmd/ ) {
+         printf "%6s :: $cfg{$k}\n", $k;
+      }
+   }
+   print @xcmds;
+   print "\nCommands set to execute: \n";
+   foreach (@xcmds) {   
+      if (defined $cfg{"cmd$_"} ) {
+         print "$_ :: " . $cfg{"cmd$_"} ."\n" 
+      }
+   }
+}
+
+
+# ---------------------------------------------------------------------------- #
+# parse config file                                                            #
+# ---------------------------------------------------------------------------- #
+sub cfg_parse(){
+
+    my ($cfgfile,$cfg_ref) = @_;
+
+    my $mode  = (stat($cfgfile))[2] ;
+    my $owner = (stat($cfgfile))[4] ;
+    $mode=sprintf("0%o", $mode & 07777);
+    #print ":$mode:$owner:\n";
+    if ( ( $mode !~ /0[64]00/ || $owner ne $$cfg_ref{useruid} ) && !  $op{op_dbg}  ){
+        print "Bad owner or permissions on $cfgfile\n";
+        exit 1;
+    }
+
+    if (open CFGFL, $cfgfile){
+       while (<CFGFL>) {
+          chomp;
+          s/^\s+//;  # left trim 
+          # process only not empty line and not comment line 
+          #if ($_ !~ /(^#)|(^$)|(^cmd)|(^defcmd)/){
+          if ($_ !~ /(^#)|(^$)|(^cmd)|(^defcmd)|(^passwdb)|(^proxy_url)|(^knock_seq)|(^cmd_alias)/){
+             s/[\s+]//g;
+             my ($key,$value) = split /=/;
+             if ($value){
+                $value =~ s/^~\//$ENV{'HOME'}/;
+                $$cfg_ref{"$key"} = $value;
+                #print "$key,$value\n";
+                #print $$cfg_ref{"$key"} .$/;
+             }
+             #print "$_\n";
+          }
+          elsif (/^proxy_url/){
+             s/[\s+]//g;
+             my ($key,$value) = split /=/;
+             $$cfg_ref{"$key"} = $value;
+
+             if ($value =~ /^(http|socks[45]*):\/\/(.*)/){
+                 $$cfg_ref{proxy_type} = $1;
+                 my ($hp,$ho,$po) = ($2,undef,undef);
+                 if ( $hp =~ /(.*):([0-9]+)/ ){
+                    #print "via: $1, $2 , $hp \n";
+                    $ho = $1; $po = $2
+                 }
+                 else { 
+                    $ho = $hp ; 
+                 }  
+                 $$cfg_ref{proxy_host} = $ho;
+                 $$cfg_ref{proxy_port} = $po if defined $po;
+             } 
+          
+          }
+          elsif (/^knock_seq/){
+             s/[\s+]//g;
+             my ($key,$value) = split /=/;
+             #$$cfg_ref{"$key"} = $value;
+             foreach my $p ( split (/,/,$value) ){
+                if ($p =~ /^[0-9]+$/ && $p <= 65535 ){
+                   push @{$$cfg_ref{$key}},$p;
+                }
+                else { 
+                   print "ERR:: Parsing knock_seq - '$p' is not a port number.\n"; 
+                   exit 1;
+                }
+             }
+          }
+          elsif ($_ =~ /^(cmd\d)|^(defcmd)/){
+             my ($key,$value) = split /::/, $_,2 ;
+             $$cfg_ref{"$key"} = $value;
+             #print "$_\n";
+          }
+          elsif ($_ =~ /^cmd_alias/){
+             if (/^cmd_alias:(.*):CMD\{(.*)\}$/){
+                print "cmdalias: '$1' - '$2'\n" if $op{op_dbg};
+                $$cfg_ref{"cmd_alias"}{$1} = $2;
+             }
+             if (/^cmd_alias:(.*):FILE\{(.*)\}$/){
+                print "cmdalias: '$1' - '$2'\n" if $op{op_dbg};
+                my ($a,$f) = ($1,$2); 
+                $f =~ s/\~/$ENV{HOME}/;
+                if (-e $f) {
+                   open CAF, $f or die $!;
+                   my @caf = <CAF>; 
+                   close CAF;
+
+                   foreach (@caf) { 
+                      unless (/^$|^#/) {
+                         #print "> $_";
+                         $$cfg_ref{"cmd_alias"}{$a} .= $_;
+                      }
+                   }
+                   #$$cfg_ref{"cmd_alias"}{$1} = join ("", @caf); 
+                }
+                else {
+                   print  "ERROR :: Parsing cmd_alias - '$f' not exists. \n".
+                          "         Verify your configuration.\n"; 
+                   exit 1;
+                }
+             }
+             if (/^cmd_alias:(.*):CODE\{(.*)\}$/){
+                print "cmdalias: '$1' - '$2'\n" if $op{op_dbg};
+                my ($a,$f) = ($1,$2); 
+                $f =~ s/\~/$ENV{HOME}/;
+                if (-e $f) {
+                   open CAF, $f or die $!;
+                   my @caf = <CAF>;
+                   close CAF;
+                   foreach (@caf) { 
+                      unless (/^$|^#/) {
+                         #print "> $_";
+                         $$cfg_ref{"cmd_alias"}{CODE}{$a} .= $_;
+                      }
+                   }
+                   #dump    $$cfg_ref{"cmd_alias"}{CODE};
+                   #$$cfg_ref{"cmd_alias"}{CODE}{$1} = join ("", @caf);
+                }
+                else {
+                   die "ERROR :: Parsing cmd_alias '$a' -> '$f' not exists. \n".
+                       "         Verify your configuration.\n";
+                }
+             }
+          }
+          elsif (/^passwd/){
+             my ($key,$value) = split /=/;
+             # clear default passwdb location and use new one from config 
+             @{$$cfg_ref{passwdb}} = ();
+             foreach ( split (/,/,$value) ){
+                s/\~/$ENV{HOME}/;  # replace ~ with home dir
+                s/^\s+|\s+$//g;    # trim right and left whitespaces
+                if (-e "$_") {
+                   print "DB exists: '$_'\n" if $op{op_dbg};
+                   my $mode  = (stat($_))[2] ;
+                   my $owner =  (stat($_))[4] ;
+                   $mode=sprintf("0%o", $mode & 07777);
+                   #print ":$mode:$owner:$_:\n";
+                   if ( ( $mode !~ /0[64]00/ || $owner ne $$cfg_ref{useruid} ) && ! $op{op_dbg}  ){
+                      print "Bad owner or permissions on $_ !\n";
+                      exit 1;
+                   }
+
+                   push @{$$cfg_ref{passwdb}},$_;
+                 }
+                 else { print "WRR:: DB not exists: '$_'\n" if $op{op_dbg}; }
+             }
+             #dump @{$$cfg_ref{passwdb}};
+
+          }
+       }
+       close CFGFL;
+    }
+    else {
+       die "ERR :: Config file '$cfgfile' could not be opened properly"; #$!"; 
+    }
+
+}
+# ---------------------------------------------------------------------------- #
+
+sub cfg_cal_parse {
+
+   my $cfg_ref   = shift; 
+   my $cal_ref   = shift; 
+   my $mode      = shift;
+   my $cmd_alias = undef;
+
+   # cmd_alias and cmd_alias args from CLI 
+   if (keys  %{$cal_ref} ){
+      foreach  my $k ( keys %{$cal_ref} ){
+         $cmd_alias = $k;
+         #print "$cmd_alias: " ; 
+         #foreach (@{$$cal_ref{$k}}) {print $_  . "\n"; }
+          
+      }
+      #print $/;
+   }
+#   print "Mode: $mode\n";
+   # find this cmd_alias from cli in cfg 
+   if (defined $$cfg_ref{cmd_alias}{$cmd_alias}) {
+      if ($$cfg_ref{cmd_alias}{$cmd_alias} =~ /CMDARG\[0\]/ && $mode !~ /single/){
+         die "ERROR :: No support for CMDARG[0] in parallel/serial mode. \n".
+             "Please rewrite your aliases arguments\n";
+      }
+
+
+      # ---------------------------------------------------------------------- #
+      # get number of unique occurences of CMDARG[[0-9] in command
+      # ---------------------------------------------------------------------- #
+
+      my @cmdarg_occurences =  $$cfg_ref{cmd_alias}{$cmd_alias}  =~ /(\$CMDARG\[[0-9]+\])/g ;
+      #   dump @cmdarg_occurences; # list of found CMDARG[] in command
+      my %counts; ++$counts{$_} for @cmdarg_occurences;
+      #  dump @unique;             # list of unique CMDARG 
+      my $cfg_cmd_args  = keys(%counts);
+      #  dump keys(%counts);
+      # do not count $CMDARG[0] occurences in command 
+      $cfg_cmd_args = $cfg_cmd_args - 1 if (defined $counts{"\$CMDARG[0]"});
+
+
+      # ---------------------------------------------------------------------- #
+      # $cli_cmd_args -  1  because @{$$cal_ref{$cmd_alias}} has CMDARG[0]
+      #                  which is host_alias
+      # @{$$cal_ref{$cmd_alias}} is (cmdarg0,cmdarg1,..,cmdargN)
+      # ---------------------------------------------------------------------- #
+      
+      my $cli_cmd_args = scalar @{$$cal_ref{$cmd_alias}} - 1 ;
+
+
+
+#      dump $$cfg_ref{cmd_alias}{$cmd_alias};
+#      dump @{$$cal_ref{$cmd_alias}};
+#      print "$cli_cmd_args != $cfg_cmd_args\n"; 
+
+
+      if ($cli_cmd_args != $cfg_cmd_args){
+         printf "Missing command alias arguments (%s/%s) for definied ".
+                "cmd_alias: '%s'.\n", $cli_cmd_args,$cfg_cmd_args,$cmd_alias;
+         if ($cfg{tooltips} eq 'on' and not defined $op{op_quiet} ){
+            print  "\n ".prl($LU-2,'-').$/;
+
+            printf ": This command alias is defined in configuration with  %2s  arguments but %6s:\n".
+                   ": number of CMDARGS from CLI is  %2s  %42s:\n",$cfg_cmd_args,' ',$cli_cmd_args,' ';
+            printf ":%78s:\n",' ';
+            print  ": If you need dynamic number of arguments use CODE{} block with cmd_alias.     :\n".
+                   ": Blocks CMD{} and FILE{} must have exactly the same number of arguments       :\n".
+                   ": from CLI as the number defined in the configuration.                         :\n";
+ 
+            print ' '.prl($LU-2,'-').$/;
+         }
+         exit 1;
+      }
+      if (defined $op{op_rlocal}){
+         print prl($LU,'-').$/ ; 
+         print "> Your alias <\n".prl($LU,'-').$/.$$cfg_ref{cmd_alias}{$cmd_alias} ."\n";
+      }
+      # FIND MACRO $CMDARG[\d+] from config and replace 
+      # with arguments from CLI
+      for (my $i=0; $i <=  $#{$$cal_ref{$cmd_alias}}; $i++ ) {
+     
+         #print @{$$cal_ref{$cmd_alias}}[$i]."\n";
+         my $cmdarg = @{$$cal_ref{$cmd_alias}}[$i]; 
+         #my $j = $i + 1;
+         #$$cfg_ref{cmd_alias}{$cmd_alias} =~ s/\$CMDARG\[$j\]/$cmdarg/g;
+         $$cfg_ref{cmd_alias}{$cmd_alias} =~ s/\$CMDARG\[$i\]/$cmdarg/g;
+
+      }
+
+      if (defined $op{op_rlocal}){
+         print prl($LU,'-').$/ ; 
+         print "> After processing <\n".prl($LU,'-').$/. $$cfg_ref{cmd_alias}{$cmd_alias} ."\n";
+         print prl($LU,'-').$/ ; 
+#         print "> Bash syntax <\n".prl($LU,'-').$/;
+#         my $bashsyntax = `bash -n <( $$cfg_ref{cmd_alias}{$cmd_alias} )`;
+         print "Execute locally [y/N]: ";
+         if (<STDIN> =~ /yes|y/i) {
+             print prl($LU,'-').$/ ; 
+            `$$cfg_ref{cmd_alias}{$cmd_alias}`;
+             print prl($LU,'-').$/ ; 
+         }
+         exit 0;
+      }
+
+
+      return $$cfg_ref{cmd_alias}{$cmd_alias} ;
+   }
+   elsif (defined $$cfg_ref{cmd_alias}{CODE}{$cmd_alias}) {
+      #print"$cmd_alias is CODE{} block alias\n";
+      # in CODE{} block we replace CMDARGS like with CMD and FILE 
+      # but we do not verify if number of CMDARG from cli are eq 
+      # to this defined in CODE block, so in CODE{} you need to write
+      # your own verification method
+      if ($$cfg_ref{cmd_alias}{CODE}{$cmd_alias} =~ /CMDARG\[0\]/ && $mode !~ /single/){
+         die "ERROR :: No support for CMDARG[0] in parallel/serial mode. \n".
+             "Please rewrite your aliases arguments\n";
+      }
+      if (defined $op{op_rlocal}){
+         print prl($LU,'-').$/ ; 
+         print "> Your alias <\n".prl($LU,'-').$/.$$cfg_ref{cmd_alias}{CODE}{$cmd_alias} ."\n";
+      }
+      for (my $i=0; $i <=  $#{$$cal_ref{$cmd_alias}}; $i++ ) {
+         #print @{$$cal_ref{$cmd_alias}}[$i]."\n";
+         my $cmdarg = @{$$cal_ref{$cmd_alias}}[$i]; 
+         #my $j = $i + 1;
+         #$$cfg_ref{cmd_alias}{CODE}{$cmd_alias} =~ s/\$CMDARG\[$j\]/$cmdarg/g;
+         $$cfg_ref{cmd_alias}{CODE}{$cmd_alias} =~ s/\$CMDARG\[$i\]/$cmdarg/g;
+      }
+      # pozostale CMDARGS w odzie zastap // in command 
+      $$cfg_ref{cmd_alias}{CODE}{$cmd_alias} =~ s/\$CMDARG\[[0-9]+\]//g;
+
+      if (defined $op{op_rlocal}){
+         print prl($LU,'-').$/ ; 
+         print "> After processing <\n".prl($LU,'-').$/. $$cfg_ref{cmd_alias}{CODE}{$cmd_alias} ."\n";
+         print prl($LU,'-').$/ ; 
+#         print "> Bash syntax <\n".prl($LU,'-').$/;
+#         my $bashsyntax = `bash -n <( $$cfg_ref{cmd_alias}{CODE}{$cmd_alias} )`;
+         print "Execute locally [y/N]: ";
+         if (<STDIN> =~ /yes|y/i) {
+             print prl($LU,'-').$/ ; 
+            `$$cfg_ref{cmd_alias}{CODE}{$cmd_alias}`;
+             print prl($LU,'-').$/ ; 
+         }
+         exit 0;
+      }
+
+      return $$cfg_ref{cmd_alias}{CODE}{$cmd_alias} ;
+
+   }
+   else {
+      die "ERROR :: No such cmd_alias '$cmd_alias' in your config. \n";
+   }
+
+}
+
+# ---------------------------------------------------------------------------- #
+sub find_cmd(){
+
+   my @cmd_dirs = ( '/bin','/usr/bin','/usr/local/bin',
+                    '/sbin','/usr/sbin',"$ENV{HOME}/.bin");
+   foreach (@cmd_dirs ) {
+      if (-e "$_/$_[0]") {
+          return "$_/$_[0]";   last;
+      }
+   }
+
+}
+# ---------------------------------------------------------------------------- #
+sub prl {
+
+   my ($no,$ch) = @_; my $line = '';
+   for(my $i=0;$i<= $no;$i++) { $line.="$ch"; }
+   return $line;
+
+}
+sub cll { 
+   return sprintf "\r%".$LU."s",' '; 
+}
+# ---------------------------------------------------------------------------- #
+sub optno {
+
+   my $i=0; foreach (@_) { $i++ if defined $_; }
+   return $i;
+
+}
+# ---------------------------------------------------------------------------- #
+sub fqdncheck(){
+
+   my $val_addr =  shift;
+   chomp $val_addr;
+
+   # regex only match a syntax, not a dns fqdn 
+   return 0 if length $val_addr > 255;
+   #print "$val_addr: " . length($val_addr) . "\n";  
+
+   my $fqdn_re = '(?:(?:(?:(?:[a-zA-Z0-9][-a-zA-Z0-9]{0,61})?[a-zA-Z0-9])[.])*(?:[a-zA-Z][-a-zA-Z0-9]{0,61}[a-zA-Z0-9]|[a-zA-Z])[.]?)';
+
+   if ( $val_addr =~ /$fqdn_re/ ){
+      #print ":$1:$2:\n"; 
+      return 1 ; # it looks like a hostname
+   }
+   else {
+      return 0 ; # it doesn't 
+   }
+}
+# ---------------------------------------------------------------------------- #
+sub iscidr{
+
+    my $val_addr =  shift;
+    chomp $val_addr;
+
+    if ( $val_addr =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/(\d{1,2})$/ ){
+       if (&ipcheck($1) and ($2 >= 0 && $2 <= 32)){
+          #print "CIDR: $2\n"; 
+          return 1;
+       }
+       else { 
+          return 0;
+       }
+    }
+    else {
+       return 0;
+    }
+
+}
+
+sub isincidr {
+
+    my $ip    = shift; 
+    my $cidr  = shift;
+
+    # print "Checkin $ip in $cidr .. \n";
+    if ( eval { require Net::CIDR; 1; } ) {
+       #my @list = ("$cidr");
+       #print " >>>" .   Net::CIDR::cidrlookup("$ip", @list) ."\n";
+       
+       return Net::CIDR::cidrlookup("$ip",("$cidr"));
+    }
+    else {
+       print "\nCIDR is currently supported only with  Net::CIDR , please install !\n";
+       exit 0;
+       # todo - my own function withou cpan use 
+    }
+
+}
+# ---------------------------------------------------------------------------- #
+sub ipcheck(){
+
+     my $val_addr =  shift;
+     chomp $val_addr;
+     # use Data::Validate::IP qw(is_ipv4 is_ipv6);
+     if ( eval { require Data::Validate::IP; 1; } ) {
+        if (Data::Validate::IP->new()->is_ipv4($val_addr)){
+           return 1 ; # it is ipv4
+        }
+        else {
+           #print "'$val_addr' :: not an IPv4 ip\n";
+           return 0 ; # it is not an ipv4
+        }
+     }
+     else  {
+        # a little clever way with qr nad scope test 
+        my $rx = qr/^(?!(\.))(\.?(\d{1,3})(?(?{$^N > 255})(*FAIL))){4}$/;
+        if ( $val_addr  =~ $rx ){
+        #if ( $val_addr =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/ ){
+           return 1 ; # it is ipv4
+        }
+        else {
+           return 0 ; # it is not an ipv4
+        }
+     }
+}
+# ---------------------------------------------------------------------------- #
+sub ip2fqdn(){
+
+   use Socket;
+
+   my $ip = shift;
+   
+   #print "IP2FQDN: $ip " . &ipcheck($ip) ."\n";
+   return 0 if ( ! &ipcheck($ip) );
+
+   if (my $name = gethostbyaddr(inet_aton($ip),AF_INET)){
+      return $name ;
+   }
+   else {
+     return 0;
+     #print  "$fqdn is not resolving.\n";  exit 1;
+   }
+
+}
+
+# ---------------------------------------------------------------------------- #
+sub fqdn2ip(){
+
+   use Socket;
+
+   my $fqdn = $_[0];
+   if (gethostbyname($fqdn)){
+      return inet_ntoa(inet_aton($fqdn));
+   }
+   else {
+     return 0;
+     #print  "$fqdn is not resolving.\n";  exit 1;
+   }
+
+}
+# ---------------------------------------------------------------------------- #
+sub checkport {
+
+   my $host = shift;
+   my $port = shift;
+   my $timeout = 1;
+
+   use IO::Socket;
+   my $socket = IO::Socket::INET->new(
+      PeerAddr => $host ,
+      PeerPort => $port ,
+      Proto    => 'tcp' ,
+      Timeout  => $timeout,
+   );
+   if ($socket){      #print "Port $port is open.\n";
+      return 1;
+   }
+   else {             #print "$port > closed\n";
+      return 0;
+   }
+
+}
+# ---------------------------------------------------------------------------- #
+sub get_freeport {
+
+    my $host = shift;
+    my $port = shift;
+
+    for (;$port<$port+1000;$port++){
+       if ($port < 65535 && !checkport($host,$port) ){
+          return  $port;
+       }
+    }
+
+}
+
+# ---------------------------------------------------------------------------- #
+sub psfind {
+
+   my $cmdargs = shift;
+
+   open (PS, "\\ps -C ssh -o pid=,args=|") or die $!;
+   my @ps = <PS>;
+   close PS;
+
+   #print "'$cmdargs'";
+   my %rps;
+   foreach my $psl (@ps){
+      if ($psl =~ /$cmdargs/) {
+         $psl =~ s/^\s+|\s+$//g;
+         #print $psl;
+         my ($pid,$pscmd) = split / /, $psl, 2;
+         #print "pid:$pid\ncmd:$pscmd\n";
+         $rps{$pid}=$pscmd;
+      }
+   }
+   return \%rps;
+
+}
+# ---------------------------------------------------------------------------- #
+sub knocker {
+
+   my $h = shift;
+
+#   print "$h" if defined $h;
+
+   print "Please enter port sequence seperated by comma or whitespaces:\n> ";
+   my @kp;  
+   $| = 1;  # force a flush after our print
+   foreach my $p (split /[,\s+]/, <STDIN>) {
+      $p =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+      if ($p =~ /^[0-9]+$/ && $p <= 65535 ){
+         push @kp, $p; 
+      }
+   }
+   if (! defined $h){
+      print "Please enter hostname:\n> ";
+      $h = <STDIN>; chomp $h; 
+   }
+   print "Knock ". scalar @kp . " port(s): [ " ; 
+   foreach (@kp){ print "$_ ";} 
+   print "] on $h ";
+   print "[yes/No]?> ";
+   if (<STDIN> =~ /[yY]es/) { 
+      print "Knocking .. ";
+      foreach my $p (@kp){ 
+         print cll . "\rKnocking $p ..";
+         if (checkport($h,$p)){
+            print ".";
+         } 
+      }
+      print cll . "\rPort Knocked!\n";
+   }
+
+}
+# ---------------------------------------------------------------------------- #
+# NETCAT :
+#
+# apt-get install netcat-openbsd
+# sbopkg -i netcat-openbsd
+# yum install netcat-openbsd
+
+sub backend_nc {
+
+   # check supported  version, only openbsd version support -x -X args
+   my $exec = shift; #print $exec.$/;
+
+   open (EX,"$exec -h 2>&1 |") || die "Failed to execute netcat: $!\n";
+   my $out = <EX>;
+   close EX;
+   $out =~ /^OpenBSD netcat/m and return 1;
+   return 0;
+}
+
+
+# ---------------------------------------------------------------------------- #
+# gpg password management                                                      #
+# ---------------------------------------------------------------------------- # 
+sub gpgpwdman { 
+
+     my ($cfg_ref, $dbpasswd, $option, $alias) = @_;
+     # $dbpasswd - must be an ARRAY
+     
+     # GPG AGENT ##
+     my @agentargs = ('--daemon',
+                      "--quiet",
+                      "--write-env-file=$ENV{HOME}/.gpg-agent-info",
+                      "--log-file=$ENV{HOME}/.gnupg/gpg-agent.log",
+                      "--use-standard-socket",
+                      "--default-cache-ttl=$$cfg_ref{agentttl}",
+                      "--max-cache-ttl=$$cfg_ref{agentttl}",
+                      "--pinentry-program=".$$cfg_ref{exec_pinentry}.$$cfg_ref{pinui},
+                   );
+     my @agent_extraargs = (
+                      "--enable-ssh-support",
+                      "--scdaemon-program=$$cfg_ref{exec_scdaemon}",
+                      "--default-cache-ttl-ssh=$$cfg_ref{agentttl}",
+                      "--max-cache-ttl-ssh=$$cfg_ref{agentttl}",
+#                      "--debug-all",
+     
+     );
+     if ($$cfg_ref{scsupport} =~ /on|yes|true|1/) {
+        push @agentargs, @agent_extraargs;
+     }
+
+     print "ASSH :: Setting agent for password menagement.\n" if defined $op{op_dbg};
+     #dump @agentargs; 
+
+     my @pid = split /\n/, `ps -C gpg-agent -o "%p:%u" --no-headers`; 
+     #dump @pid;     
+     #print grep /:$$cfg_ref{username}$/ , @pid ; 
+     if (my @w = grep (/:$$cfg_ref{username}$/, @pid) ) {
+        print "ASSH :: GPG_AGENT is already running [ $w[0] ].\n" if defined $op{op_dbg};
+     }
+     else {
+        print "ASSH :: GPG_AGENT is not runing. Starting one ..\n";
+        #system($gpgagent, @agentargs) == 0 or die  "ERR :: system function error $?.\n";
+        system($$cfg_ref{exec_gpgagent}, @agentargs) == 0 or 
+           die  "ERR :: system function error $?.\n";
+     }
+     ##
+     my $gpgargs = '-q --no-tty';
+     SWITCH: for ($option) {
+        /groups/ && do {
+
+            my %gpgpwd = ();
+            foreach my $pwdfl  (@{$dbpasswd}){
+               print "$pwdfl in usage\n" if $op{op_dbg};
+               open(GPGFL,"$$cfg_ref{exec_gpg2} $gpgargs -d $pwdfl |");
+               push @{$gpgpwd{$pwdfl}} , <GPGFL>;
+               close(GPGFL);
+            }
+
+            #my %pwret = ();
+            my %groups = ();
+            foreach my $pwdfl (keys %gpgpwd){            
+               foreach my $rec (@{$gpgpwd{$pwdfl}}){
+                   my @hr = split(/:/, $rec , 8 );
+                   #dump @hr;
+                   my $extras = $hr[7];
+                   if (defined $hr[7]){
+                      my @extra_opt = split /;/, $hr[7];
+   
+                      foreach (@extra_opt){
+                          # find records which contain a group() keyword
+                          if (/^(group[s]*\{(.*)\})$/){
+                             #print "GROUPS : $hr[0] - $1 - $2\n" ;#if $op{op_dbg};
+                             #$pwret{$pwdfl} = $rec;
+                             # hr[0] - an alias field
+                             foreach my $gr ( (split /,/,$2) ){
+                                #print "$gr\n";
+                                push  @{$groups{$gr}}, $hr[0];
+                             }
+                         }
+                      }
+                   }
+               }
+            } 
+
+            #return \%groups if keys %groups;
+            return \%groups ;
+            #exit 0; 
+            #return \%pwret if keys %pwret;
+
+        };
+        /^(search)$/ && do { 
+            # find alias 
+            my %gpgpwd = ();
+            foreach my $pwdfl  (@{$dbpasswd}){
+               print "$pwdfl in usage\n" if $op{op_dbg};
+               open(GPGFL,"$$cfg_ref{exec_gpg2} $gpgargs -d $pwdfl |");
+               push @{$gpgpwd{$pwdfl}} , <GPGFL>;
+               close(GPGFL);
+            }
+            #dump %gpgpwd;
+            #exit;
+            # if alias is alias or ip/fqdn matching to IP FIELD
+            my %pwret = ();
+            foreach my $pwdfl (keys %gpgpwd){            
+               foreach (@{$gpgpwd{$pwdfl}}){
+                  if (/^($alias):|^(.*):($alias):([0-9]*):(.*):(.*):(.*):(.*):(.*)/){
+                     chomp;
+                     #print " $1, $2, $3, $4, $5, $6, $7, $8  - \n";
+                     #print "$_\n";
+                     $pwret{$pwdfl} = $_;
+                     
+                  }
+               }
+            }
+            return \%pwret if keys %pwret;
+
+            # if you do not find by an alias  ( which could be alias/hostname/ip ) 
+            # check if alias is a hostname and resolv an IP addr
+            # than look again
+            #print &fqdncheck($alias) ."\n";
+            if ( &fqdncheck($alias)){
+               if ( my $ralias = &fqdn2ip($alias)){
+                  print "$alias resolving to $ralias\n";
+                  foreach my $pwdfl (keys %gpgpwd){            
+                     foreach (@{$gpgpwd{$pwdfl}}){
+                         #print "^($ralias):|^(.*):($ralias):([0-9]*):(.*):(.*):(.*):(.*):(.*)/\n";
+                         if (/^($ralias):|^(.*):($ralias):([0-9]*):(.*):(.*):(.*):(.*):(.*)/){
+                            #print "$1-$2-$3\n";
+                            my $h = $1 || $2;
+                            print "$ralias was found as IP belonging to host $h .. \n";
+                            chomp; 
+                            $pwret{$pwdfl} = $_;
+                         }
+                     }   
+                  }
+                  return \%pwret if keys %pwret;
+               }
+            }
+            # if you do not find by an alias ( which could be alias/hostname/ip ) 
+            # and by translating hostname to an IP try translate hostname to IP
+            # and look again
+          
+            #print "ALIAS: $alias ->" .&ipcheck($alias) . &ipcheck(&fqdn2ip($alias))."\n";
+            if ( &ipcheck($alias) || &ipcheck(&fqdn2ip($alias))){
+               #print &ip2fqdn($alias) ."\n";
+               if ( my $ralias = &ip2fqdn($alias)){
+                  print "$alias resolving to $ralias\n";
+                  print "Searching $ralias in database .. ";
+                  foreach my $pwdfl (keys %gpgpwd){            
+                     foreach (@{$gpgpwd{$pwdfl}}){
+                         if (/^($ralias):|^(.*):($ralias):([0-9]*):(.*):(.*):(.*):(.*):(.*)/){
+                            my $h = $1 || $2;
+                            print "\r$ralias was found as IP belonging to host $h ..\n";
+                            chomp;
+                            $pwret{$pwdfl} = $_;
+
+                         }
+                     }   
+                  }
+                  return \%pwret if keys %pwret;
+               }
+               # serch ipv4{} keyword
+
+               $alias = &fqdn2ip($alias) if &ipcheck(&fqdn2ip($alias));
+
+               if ( &ipcheck($alias) ){
+                  ## my @hr = split(/:/, $$host_ref{$k} , 8 );
+                  print "\rSearching $alias in ipv4 aliases ..";
+
+                  foreach my $pwdfl (keys %gpgpwd){            
+                     foreach my $rec (@{$gpgpwd{$pwdfl}}){
+                        my @hr = split(/:/, $rec , 8 );
+                        #dump @hr;
+                        my $extras = $hr[7];
+                      if (defined $hr[7]){
+                        my @extra_opt = split /;/, $hr[7];
+                        foreach my $opt (qw/ipv4 ipv6/){
+                           foreach (@extra_opt) {
+                              if (/^($opt\{(.*)\})$/){
+                                 #print "$1-$2\n";
+                                 if ($opt eq 'ipv4'){
+                                    my @ipv4s = split /,/,$2;
+                                    foreach my $ipv4 (@ipv4s){
+                                       $ipv4 =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+                                       if (&ipcheck($ipv4)){
+                                          #print " > $ipv4 is IPv4\n"; 
+                                          if ($alias eq $ipv4) {
+                                             print "\r$alias was found as secondary IP belonging of $hr[0]";
+                                             $pwret{$pwdfl} = $rec;
+                                          }
+                                       }
+                                       elsif(&iscidr($ipv4)){
+                                          #print " > $ipv4 is IPv4 CIDR \n"; 
+                                          if (&isincidr($alias,$ipv4)){
+                                             print "\r$alias was found as part of network $ipv4 belonging to '$hr[0]'";
+                                             $pwret{$pwdfl} = $rec;
+                                          }
+                                       }
+                                    }
+                                 }
+                              }
+                              #elsif ($opt eq 'ipv6'){
+                              #   my @ipv6s = split /,/,$2;
+                              #   foreach my $ipv6 (@ipv6s){
+                              #      $ipv6 =~ s/^\s+|\s+$//g;
+                              # 
+                              #   }
+                              #   #print "IPv6 currently unsupported\n";
+                              #}
+                           }
+                        }
+                       }
+                     }   
+                  }
+                  print $/;
+                  #return \%pwret if keys %pwret;
+                  if (keys %pwret) {
+                     return \%pwret; 
+                  }
+                  else { 
+                     print "ERR :: Couldn't find data record for '$alias'\n"; 
+                     exit 1;
+                  }
+               }
+
+            }
+            else { 
+               print "ERR :: Couldn't find data record for '$alias'\n"; 
+               exit 1;
+            }
+        };
+        /getaliases/ && do {
+            my @aliases ;
+            my @gpgpwd = ();
+            foreach my $pwdfl  (@{$dbpasswd}){
+               #print "$pwdfl in usage\n";
+               open(GPGFL,"$$cfg_ref{exec_gpg2} $gpgargs -d $pwdfl |");
+               push @gpgpwd, <GPGFL>;
+               close(GPGFL);
+            }
+
+            # print @gpgpwd;
+            for(@gpgpwd) {
+               my @tm = split (/:/,$_);
+               # print "$tm[0]\n" if ( $tm[0] !~ /^(--|\s|#)/ );
+               push @aliases, $tm[0] if ( $tm[0] !~ /^(--|\s|#)/ ); 
+            }
+            #print "@aliases\n";
+            return \@aliases;
+        };
+        /gethosts/ && do {
+            my @hosts ;
+            my @gpgpwd = ();
+            foreach my $pwdfl  (@{$dbpasswd}){
+               #print "$pwdfl in usage\n";
+               open(GPGFL,"$$cfg_ref{exec_gpg2} $gpgargs -d $pwdfl |");
+               push @gpgpwd, <GPGFL>;
+               close(GPGFL);
+            }
+
+            # print @gpgpwd;
+            for(@gpgpwd) {
+               my @tm = split (/:/,$_);
+               # print "$tm[1]\n" if ( $tm[0] !~ /^(--|\s|#)/ );
+               push @hosts, $tm[1] if ( $tm[0] !~ /^(--|\s|#)/ ); 
+            }
+            #print "@hosts\n";
+            return \@hosts;
+        },
+        /getalihos/ && do {
+            my @alihos ;
+            my @gpgpwd = ();
+            foreach my $pwdfl  (@{$dbpasswd}){
+               #print "$pwdfl in usage\n";
+               open(GPGFL,"$$cfg_ref{exec_gpg2} $gpgargs -d $pwdfl |");
+               push @gpgpwd, <GPGFL>;
+               close(GPGFL);
+            }
+            # print @gpgpwd;
+            for(@gpgpwd) {
+               my @tm = split (/:/,$_);
+               # print "$tm[1]\n" if ( $tm[0] !~ /^(--|\s|#)/ );
+               push @alihos, $tm[0] if ( $tm[0] !~ /^(--|\s|#)/ ); 
+               push @alihos, $tm[1] if ( $tm[0] !~ /^(--|\s|#)/ ); 
+            }
+           #print "@hosts\n";
+            return \@alihos;
+        }
+
+
+     }
+     print "end_of_fun\n";
+}
+
+# -----------------------------------------------------------------------------
+# get record from gpg databases 
+# -----------------------------------------------------------------------------
+sub get_record {
+
+     my $host_ref = shift;
+     my $alias    = shift;
+     my %hostrec = ();
+
+     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+     # parse last field from password record / comment field
+     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+     sub get_extra_opts {
+
+         my $hostrec_ref = shift;
+         my $record      = shift;
+
+         if ($record) {
+            #print $record; 
+             my @extra_opt = split /;/, $record;
+             #dump @extra_opt;
+             foreach my $opt (qw/local remote socks knock via proxy ipv4 ipv6 note comment group groups/){
+                print "searching $opt\n" if $op{op_dbg};
+                foreach (@extra_opt) {
+                   if (/^($opt\{(.*)\})$/){
+                      my $val = $2;
+                      #print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                      if ($opt eq 'local'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ( $val =~ /^((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+                             print "local val: ok\n" if $op{op_dbg};
+                             $$hostrec_ref{extra}{local} = $val;
+                         }
+                      }
+                      if ($opt eq 'remote'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ( $val =~ /^((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+                             print "remote val: ok\n" if $op{op_dbg};
+                             $$hostrec_ref{extra}{remote} = $val;
+                         }
+                      }
+                      if ($opt eq 'socks'){
+                         #print " > found: '$opt' - '$1' - '$2' \n";
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ($val =~ /^((.*):)?([0-9]+)$/) {
+                            print "socks val: ok\n" if $op{op_dbg};
+
+                            $$hostrec_ref{extra}{socks_bind} = $2; # || '127.0.0.1';
+                            $$hostrec_ref{extra}{socks_port} = $3;
+                         }
+                      }
+                      if ($opt eq 'knock'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         my @t = split /,/, $val;
+                         #dump @t;
+                         foreach (@t) {
+                            if (/^[0-9]+$/) {
+                               print "knock port: $_ ok\n" if $op{op_dbg};
+                               push @{$$hostrec_ref{extra}{knock_ports}}, $_;
+                            }
+                         }
+                      }
+                      if ($opt =~ /^via|proxy$/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         if ($val =~ /^(http|socks[45]*):\/\/(.*)/){
+
+                            $$hostrec_ref{extra}{proxy_type} = $1;
+                            my ($hp,$ho,$po) = ($2,undef,undef);
+                            
+                            print "via: proxy_type = $1, hp = $2 $hp \n" if $op{op_dbg};
+                            
+                            if ( $hp =~ /(.*):([0-9]+)/ ){
+                               #print "via: $1, $2 , $hp \n";
+                               $ho = $1; $po = $2
+                            }
+                            else { 
+                               $ho = $hp ; 
+                            }  
+                            $$hostrec_ref{extra}{proxy_host} = $ho;
+                            $$hostrec_ref{extra}{proxy_port} = $po if defined $po;
+                         
+                         }
+                         #if 
+                      }
+                      if ($opt eq 'ipv4'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "ipv4 val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{ipv4} = $val;
+                      } 
+                      if ($opt eq 'ipv6'){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "ipv6 val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{ipv6} = $val;
+                      } 
+                      if ($opt =~ /^(note|comment)$/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "note val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{note} = $val;
+                      }
+                      if ($opt =~ /^group/){
+                         print " > found: '$opt' - '$1' - '$val' \n" if $op{op_dbg};
+                         print "group val: ok\n" if $op{op_dbg};
+                         $$hostrec_ref{extra}{groups} = $val;
+                      }
+
+
+                   }
+                }
+             }
+             
+             dump $hostrec_ref if $op{op_dbg};
+         }
+     }
+     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+
+
+
+     if (scalar keys %{$host_ref} gt 1){
+        print "Multiple records were matched with: "; 
+           print eval $CL[5],"$alias\n",eval $CL[0];
+
+        my $i = 0;
+        my %inp ;
+        print " ".prl($LU-2,'-')."\n";
+        foreach my $k (sort keys %{$host_ref}){
+           #print "$k $$host_ref{$k}\n";
+           $inp{++$i}=$k;
+           my @hr = split(/:/, $$host_ref{$k},8);
+           printf ": %-2s | ", 'Db'; print eval $CL[4]; 
+               printf "%-72s",$k; print eval $CL[0],":\n";
+
+           if (defined $op{op_wrap}) {
+               my $reclen = length "$hr[0]:$hr[1]:$hr[3]:*******:$hr[5]:*******:$hr[7]";
+               my $s = 0; 
+               while ($reclen > 0){
+                  printf ": %-2s | %-71s :\n", $i,
+                      substr "$hr[0]:$hr[1]:$hr[3]:*******:$hr[5]:*******:$hr[7]",$s,71;
+                  $reclen -= 71;
+                  $s += 71;
+               }
+           }
+           elsif (defined $op{op_nowrap}){
+               printf ": %-2s | %-s :\n", $i, 
+                   "$hr[0]:$hr[1]:$hr[3]:*******:$hr[5]:*******:$hr[7]" ;
+           }
+           else {
+               printf ": %-2s | %-68s .. :\n", $i, 
+                  substr ("$hr[0]:$hr[1]:$hr[3]:*******:$hr[5]:*******:$hr[7]",0,67) ;
+           }
+
+        }
+        print ' '.prl($LU-2,'-')."\n";
+        #dump %inp;
+        while(1){ 
+           print "Your choose [1-$i]: ";
+           $| = 1;                # force a flush after our print
+           my $line = <STDIN>;
+           chomp $line;
+           #$| = 1;               # force a flush after our print
+           #     sleep 1; 
+           $line =~ s/[nrft]//g;
+           $line =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+           if ( $line =~ /^\s*[1-$i]\s*$/ ) {
+              if (defined $$host_ref{$inp{$line}}){
+                 #print  "Your choose: '$line' :" . $inp{$line} ."\n" ;
+                 my @hr = split(/:/, $$host_ref{$inp{$line}} , 8 );
+            
+                 # parse last field from password record / comment field
+                 # get_extra_opts(\%hostrec,$hr[7]);
+                 if (defined $hr[7]) {
+                    get_extra_opts(\%hostrec,$hr[7]);
+                 }
+                 else {
+                    $hr[7] = '<no-extras>'
+                 }
+ 
+                 %hostrec =(
+                   %hostrec,
+                   'alias' => "$hr[0]",
+                   'host'  => "$hr[1]",
+                   'port'  => "$hr[2]",
+                   'user'  => "$hr[3]",
+                   'pswd'  => "$hr[4]",
+                   'user2' => "$hr[5]",
+                   'pswd2' => "$hr[6]",
+                   'comm'  => "$hr[7]",
+                   'pwdfl' => $inp{$line},
+                 );
+                 last ;
+              }
+           }
+        }
+     }
+     else {
+        # MAMY TYLKO JEDEN KLUCZ / REKORD
+        foreach my $k (keys %{$host_ref}){
+           my @hr = split(/:/, $$host_ref{$k} , 8 );
+           # parse last field from password record / comment field
+           if (defined $hr[7]) {
+              get_extra_opts(\%hostrec,$hr[7]);
+           }
+           else {
+              $hr[7] = '<no-extras>'
+           }
+           %hostrec =(
+                    %hostrec,
+                   'alias' => "$hr[0]",
+                   'host'  => "$hr[1]",
+                   'port'  => "$hr[2]",
+                   'user'  => "$hr[3]",
+                   'pswd'  => "$hr[4]",
+                   'user2' => "$hr[5]",
+                   'pswd2' => "$hr[6]",
+                   'comm'  => "$hr[7]",
+                   'pwdfl' => $k,
+           );
+        }
+     }
+
+     return \%hostrec;
+}
+
+# -----------------------------------------------------------------------------
+# ssh port forwarding  
+# -----------------------------------------------------------------------------
+
+
+sub sshexec() {
+
+#select STDOUT;
+# $| = 1;
+#select STDERR;
+# $| = 1;
+
+no warnings ;
+
+   my $type = shift;
+   my $exec = shift;
+   my $args = shift;
+   my $pass = shift;
+   my $timeout = 60;
+   my $spawn_ok;
+
+
+   my $command = "$exec  " . join(" ",@$args)."\n";
+#print $command.$/;
+   $command =~ s/-fC2/-C2/ if $op{op_nofork};
+   $command =~ s/-v// if $op{op_nofork};
+#print $command.$/;
+
+
+   print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" if !defined $op{op_kssh} ;
+   my $exp_tun = Expect->new;
+   #$exp_tun->raw_pty(1);
+
+   $exp_tun->spawn($command)
+       or die "Cannot spawn $exec: $!\n";
+   my $exp_pid =  $exp_tun->pid();
+
+   print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "setting $type port forwarding ... ";
+   $exp_tun->log_stdout(0);
+
+   my $sshexec = $exp_tun->expect($timeout,
+               [ qr/[pP]assword:/ => sub {
+                     $exp_tun->send("$pass\n");
+                     $spawn_ok = 1;
+                     exp_continue if ! $op{op_nofork};
+                 }
+               ],
+               [ eof => sub {
+                   #$exp_tun->debug(0);
+                   if ($spawn_ok) {
+                      #print ">>". $exp_tun->exp_exitstatus() ."\n";
+                      #print ">>>". $exp_tun->exp_error() ."\n";
+                      print cll . "\rERROR: premature EOF in login (". $exp_tun->exp_error() .")\n";
+                   } else {
+                      print cll ."\rERROR: could not spawn SSH.\n";
+                   }
+
+
+                   if ($cfg{tooltips} eq 'on' and not defined $op{op_quiet} ){
+                      print <<EOF;
+
+Port forwarding is based on Expect method of passing password to SSH client. 
+Currently there is no easy and/or relaible way to do this.  In most cases it
+should work  without any problem, but in some system there is a problem with 
+forking ssh process  into  background after  passing a password and  setting 
+ports. In that  case you can try run  this  without forking with '--no-fork' 
+option and tunnel should be working as long as the console remains open.
+
+EOF
+                      print "\n" ,eval $CL[1],prl($LU,'-'),eval $CL[0],"\n";
+                   }
+
+                   exit 1;
+                 }
+               ],
+               [ timeout => sub {
+                   #die "No login.\n";
+                   print cll . "\rERROR :: Never got prompt on hostname: ".$exp_tun->exp_error()."\n";
+                   print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+                   exit 1;
+                 }
+
+               ],
+               [ qr/interactive session/ => sub {
+                   $exp_tun->expect(2);
+                   print cll . eval $CL[1],"\rASSH3 :: ",eval $CL[0] ;
+                   print "Tunnel established and forked into backgroud !";
+                   $exp_tun->interact();
+                   #   $exp_tun->close();
+
+
+                 }
+               ]
+            );
+   if ( $spawn_ok && ! $exp_tun->exp_error() ){
+       print "\n" ,eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+       print "\nPort Forwarding enabled. You can stop this session in any time with Ctrl-C .\n";
+       $exp_tun->interact();
+       $exp_tun->close();
+       #$exp_tun->soft_close();
+
+       exit 0;
+    }
+   else {
+#     print ">>". $exp_tun->exp_exitstatus() ."\n";
+#     print ">>>". $exp_tun->exp_error() ."\n";
+   }
+
+   return $exp_pid ;
+#   sleep(1);
+#   $exp_tun->close();
+   #$exp_tun->soft_close();
+}
+
+
+
+
+
+#
+sub sshexec__() {
+
+
+   my $type = shift;
+   my $exec = shift;
+   my $args = shift;
+   my $pass = shift;
+
+   my $command = "$exec  " . join(" ",@$args)."\n";
+
+   print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" if !defined $op{op_kssh} ;
+   my $exp_tun = Expect->spawn($command)
+       or die "Cannot spawn $exec: $!\n";
+   my $exp_pid =  $exp_tun->pid();
+
+   print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "setting $type port forwarding ... ";
+   $exp_tun->log_stdout(0);
+
+   my $spawn_ok;
+
+   unless( $exp_tun->expect(60, 
+               [ qr/[pP]assword:/ => sub { 
+                     $exp_tun->send("$pass\n"); 
+                 } 
+               ],
+            ) 
+         ){
+      print "\rERROR :: Never got prompt on hostname: ".$exp_tun->exp_error()."\n";
+      print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+      exit 1;
+   }
+
+
+   sleep(2);
+   $exp_tun->close();
+   #$exp_tun->soft_close();
+} 
+
+# -----------------------------------------------------------------------------
+# ssh asshlogin 
+# -----------------------------------------------------------------------------
+
+
+sub asshlogin {
+
+     my ($href, $rcmd, $stay ) = @_;
+     my $lev   = undef;
+     my $alias = undef;
+
+     my $hostrec_ref = undef; 
+     if (ref($href) eq 'HASH') { 
+        $hostrec_ref = $href;
+        $alias = $$hostrec_ref{alias};
+     }
+     else {
+        $alias = $href;
+        $hostrec_ref = &get_record(gpgpwdman(\%cfg,$cfg{passwdb},'search',$alias), $alias);
+     }
+
+#     dump $hostrec_ref;
+#     dump $alias;
+#     dump $rcmd;
+#     exit;
+
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # preview current record: 
+     # option --decode|-dec
+     
+     if ( defined $op{op_dec} ){#and not defined $op{op_pssh} ) {
+
+        print prl($LU-length($alias)-length($$hostrec_ref{pwdfl})-2,' '); 
+        print prl(length($alias)+length($$hostrec_ref{pwdfl}),'_') . "\n";
+        print prl($LU-length($alias)-length($$hostrec_ref{pwdfl})-2,' ') .
+              "$alias:$$hostrec_ref{pwdfl}\n"; 
+
+        print ' ',eval $CL[0],prl($LU-2,'-'),eval $CL[0],"\n" ;
+        printf  ":%-3s %-10s %-63s:\n",' ','Alias',$$hostrec_ref{'alias'};
+        printf  ":%-3s %-10s %-63s:\n",' ','Host', $$hostrec_ref{'host'};
+        printf  ":%-3s %-10s %-63s:\n",' ','Port', $$hostrec_ref{'port'};
+        printf  ":%-3s %-10s %-63s:\n",' ','User', $$hostrec_ref{'user'};
+        printf  ":%-3s %-10s %-63s:\n",' ','Pass', $$hostrec_ref{'pswd'};
+        printf  ":%-3s %-10s %-63s:\n",' ','User2',$$hostrec_ref{'user2'};
+        printf  ":%-3s %-10s %-63s:\n",' ','Pass2',$$hostrec_ref{'pswd2'};
+
+        if (defined $$hostrec_ref{extra}){
+           printf ":%-3s %13s %60s:\n",' ','Extra options',' ';
+           #dump $$hostrec_ref{extra};
+           printf ":%-3s %10s %-63s:\n" ,
+             ' ', 'PF L:',$$hostrec_ref{extra}{local} if defined $$hostrec_ref{extra}{local};
+           printf ":%-3s %10s %-63s:\n" ,
+             ' ', 'PF R:',$$hostrec_ref{extra}{remote} if defined $$hostrec_ref{extra}{remote};
+           my $socks = ''; 
+           $socks = $$hostrec_ref{extra}{socks_bind}.':' if (defined $$hostrec_ref{extra}{socks_bind});
+           printf ":%-3s %10s %-63s:\n" ,
+             ' ', 'PF D:', $socks . $$hostrec_ref{extra}{socks_port} if defined $$hostrec_ref{extra}{socks_port};
+
+           if (defined $$hostrec_ref{extra}{knock_ports}){
+              printf ":%-3s %10s %-63s:\n" ,
+                ' ', 'Knock:', join ' ', @{$$hostrec_ref{extra}{knock_ports}};
+           }
+
+           if (defined $$hostrec_ref{extra}{proxy_host}){
+              my $proxy; 
+              $proxy .= $$hostrec_ref{extra}{proxy_type}.'://' if exists $$hostrec_ref{extra}{proxy_type};
+              $proxy .= $$hostrec_ref{extra}{proxy_host} if exists $$hostrec_ref{extra}{proxy_host};
+              $proxy .= ':'.$$hostrec_ref{extra}{proxy_port} if exists $$hostrec_ref{extra}{proxy_port};
+              printf ":%-3s %10s %-63s:\n" ,' ','Proxy:',$proxy ; 
+           }
+           if (defined $$hostrec_ref{extra}{ipv4}){
+
+              my @ipv4_addr;
+              my @ipv4_cidr;
+              foreach my $ipv4 (split /,/, $$hostrec_ref{extra}{ipv4}){
+                 $ipv4 =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+                 if (&ipcheck($ipv4)){
+                    #print " > $ipv4 is IPv4\n";
+                    push @ipv4_addr, $ipv4;
+                 } 
+                 elsif(&iscidr($ipv4)){
+                    #print " > $ipv4 is IPv4 CIDR \n"; 
+                    push @ipv4_cidr, $ipv4;
+                 }
+              }
+
+              printf ":%-3s %10s ",' ','IPv4 CIDR:' if scalar @ipv4_cidr;
+
+              for (my $i=0; $i<=$#ipv4_cidr; ){
+                 printf ":%-3s %10s ",' ',' ' if( !($i%3) && $i != 0 ) ;
+                 print eval $CL[5] ;
+                 printf "%-18s ", $ipv4_cidr[$i++]; 
+                 printf "%-18s ", ($ipv4_cidr[$i])?$ipv4_cidr[$i]:' '; $i++;
+                 printf "%-18s ", ($ipv4_cidr[$i])?$ipv4_cidr[$i]:' '; $i++;
+                 print eval $CL[0] ;
+                 printf "%6s:\n",' ' if( !($i%3) ) ;
+              }
+
+              printf ":%-3s %10s ",' ','IPv4:' if scalar @ipv4_addr;
+              for (my $i=0; $i<=$#ipv4_addr; ){
+                 printf ":%-3s %10s ",' ',' ' if( !($i%3) && $i != 0 ) ;
+                 print eval $CL[5] ;
+                 printf "%-18s ", $ipv4_addr[$i++]; 
+                 printf "%-18s ", ($ipv4_addr[$i])?$ipv4_addr[$i]:' '; $i++;
+                 printf "%-18s ", ($ipv4_addr[$i])?$ipv4_addr[$i]:' '; $i++;
+                 print eval $CL[0] ;
+                 printf "%6s:\n",' ' if( !($i%3) ) ;
+              }
+           }
+           if (defined $$hostrec_ref{extra}{ipv6}){
+
+              my @ipv6 = split /,/, $$hostrec_ref{extra}{ipv6}; 
+              printf ":%-3s %10s ",' ','IPv6:' if scalar @ipv6;
+        
+              for (my $i=0; $i<=$#ipv6; ){
+                 printf ":%-3s %10s ",' ',' ' if( $i != 0 ) ;
+                 print eval $CL[5] ;
+                 printf "%-62s", $ipv6[$i++];
+                 print eval $CL[0] ;
+                 print " :\n";
+              }
+
+           }
+           if (defined $$hostrec_ref{extra}{note}){
+
+              #wrap
+              my $reclen = length "$$hostrec_ref{extra}{note}"; 
+              my $s = 0;
+              while ($reclen > 0){
+                 printf ":%-3s %10s %-62s :\n", ' ','Note:',
+                   substr "$$hostrec_ref{extra}{note}",$s,62;
+                 $reclen -= 62;
+                 $s += 62;
+              }
+           }
+           if (defined $$hostrec_ref{extra}{groups}){
+
+              my @groups ;
+              foreach my $gr (split /,/, $$hostrec_ref{extra}{groups}){
+                 $gr =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+                    #print " > $gr \n";
+                    push @groups, $gr;
+              }
+           
+              my $reclen = length "$$hostrec_ref{extra}{groups}";
+              my $s = 0;
+              while ($reclen > 0){
+                 printf ":%-3s %10s %-62s :\n", ' ','Groups:',
+                   #substr "$$hostrec_ref{extra}{groups}",$s,62;
+                   substr join (",", @groups),$s,62;
+                 $reclen -= 62;
+                 $s += 62;
+              }
+
+           }
+
+
+        }
+        else{
+           printf  ":%-3s %-10s %-63s:\n",' ','Comments',$$hostrec_ref{'comm'};
+        }
+        printf  ":%-3s %-10s %-63s:\n",' ','Database',$$hostrec_ref{'pwdfl'};
+        print ' ',eval $CL[0],prl($LU-2,'-'),eval $CL[0],"\n" ;
+        #exit 0;
+     }
+     elsif (defined $op{op_dec} and defined $op{op_pssh} ) {
+       return ;
+       #print "WRR: Option 'dec' not allowed in parallel mode!\n";
+     }
+     return  if defined $op{op_dec} and defined $op{op_pssh};
+     exit 0  if defined $op{op_dec};
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # erase fingerprint 
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     if (defined $op{op_finger}){
+        if (defined $cfg{exec_sshkeygen}){
+
+           my $command = "$cfg{exec_sshkeygen} -R ";
+           if ($$hostrec_ref{'port'} eq 22) {
+              $command .= $$hostrec_ref{'host'};
+           }
+           else {
+              $command .= '['.$$hostrec_ref{'host'}.']:'.$$hostrec_ref{'port'};
+           }
+           open (EX, "$command  2>&1 |") or 
+             die "Couldn't execute: $cfg{exec_sshkeygen}:$!\n";
+        }
+        else {
+           print "Can not remove fingerprint. Missing ssh-keygen in paths.\n ";
+           exit 0; 
+        }
+     }
+
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+
+     # set login level -  $lev = 1 | 2
+     ($$hostrec_ref{'user2'} eq '' && $$hostrec_ref{'pswd2'} eq '')?($lev = '1'):($lev = '2');
+     $lev = 1 if defined $op{op_nosu}; 
+
+     # set connection parameters
+     my @sshargs = (
+        'StrictHostKeyChecking=no', 
+        'ServerAliveInterval=30', 
+        'ServerAliveCountMax=10', 
+        'TCPKeepAlive=no'
+     );
+     # prepare connection data for ssh client
+     my %sshdata =(
+        'user'    => $$hostrec_ref{'user'} ,
+        'passwd'  => $$hostrec_ref{'pswd'} ,
+        'port'    => $$hostrec_ref{'port'} ,
+        'timeout' => '10000',
+        'ctl_dir' => $cfg{sockdir},
+        'master_opts' => [
+           -o => "$sshargs[0]", 
+           -o => "$sshargs[1]", 
+           -o => "$sshargs[2]", 
+           -o => "$sshargs[3]"
+        ],
+        'default_ssh_opts' => [-o => "$sshargs[1]"],
+     );
+     # -2 - log directly to 2nd user account without intermediate 1s user accounts
+     if (defined $op{op_suuser}){
+        if (defined $$hostrec_ref{'user2'} && defined $$hostrec_ref{'pswd2'}){
+           $sshdata{'user'}   = $$hostrec_ref{'user2'} ;
+           $sshdata{'passwd'} = $$hostrec_ref{'pswd2'} ;
+          
+        }
+        else {
+           print "ERR :: Sorry missind record data for second user. Try without this '-2' option.\n";
+        }
+     }
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # proxy connection - via socks4/5 or http
+     # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     # *** PROXY SETTINGS - LIST *** #
+     if (defined $op{op_lproxy}){
+        printf "%80s\n", "Proxy settings";
+        print prl($LU,'-')."\n";
+        print "Configuration of proxy_default value (first in use) : $cfg{proxy_default}\n" ;
+        print prl($LU,'-')."\n";
+        # print "Proxy settings: \n";
+
+        
+        print "Global setting (config) : ";
+        if (defined $cfg{proxy_url}){
+           print "$cfg{proxy_url}";
+           print ' (*)' if $cfg{proxy_default} =~ /config/ or ( $cfg{proxy_default} =~ /db|cli/ and
+                            (! defined $$hostrec_ref{extra}{proxy_host} && ! defined $cli{proxy_host}) );
+           print $/;
+        }
+        else { print "undefined\n"; }
+        
+        print "Record setting          : ";
+        if (defined $$hostrec_ref{extra}{proxy_host}){
+           print "$$hostrec_ref{extra}{proxy_type}://$$hostrec_ref{extra}{proxy_host}";
+           print ":$$hostrec_ref{extra}{proxy_port}" if defined $$hostrec_ref{extra}{proxy_port};
+           print ' (*)' if $cfg{proxy_default} =~ /db/ or ( $cfg{proxy_default} =~ /cli/ and 
+                              ! defined $cli{proxy_host} );
+           print $/;
+        }
+        else { print "undefined\n"; }
+        
+        print "Command line setting    : ";
+        if (defined $cli{proxy_host}){
+           print "$cli{proxy_type}://$cli{proxy_host}";
+           print ":$cli{proxy_port}" if defined $cli{proxy_port}; ;
+           print ' (*)' if $cfg{proxy_default} =~ /cli/;
+           print $/;
+      
+        }
+        else { print "undefined\n"; }
+        print prl($LU,'-')."\n";
+        print "(*) proxy in use\n";
+        print prl($LU,'-')."\n";
+        exit 0;
+     }
+     # ----------------------------------------------------------------------- #
+     # cfg{proxy_default} = cli | db | config - domyslnie cli - ozn ze jesli 
+     # proxy url jest podany w configu , dla hosta w rekordzie z bazy hasel i 
+     # jako argument cli - to adres z cli jest brany pod uwage , jesli link w cli 
+     # nie zostal podany brany jest pod uwage rekord z bazy hasel a jesli ten nie istnieje
+     # to globalny zdefiniowany w configu - czyli od bardziej szczegolnego do ogolnego 
+     #
+     # hierarchie mozna przestawic przez definicje zmiennej w konfiguracji 
+     # config = zawsze brana jest brana wartosc zdefiniowana w konfigu , 
+     #          wartosci z rekordu i cli sa ignorowane
+     # db     = brana w pierwszej kolejnosci jest wartosc z bazy hasel , jesli nie istnieje 
+     #          brana jest wartosc z configu , cli jest ignorowane
+     # cli    = domyslna opcja, brana jest wartosc z cli w pierwszej kolejnosci , jesli nie istniej 
+     #          brana jest wartosc z bazy hasel, a nastepnie z configu 
+
+
+     if ( defined $cfg{proxy_filter} && $$hostrec_ref{'alias'} =~ /$cfg{proxy_filter}/ ){ 
+        if ( defined $cfg{proxy} && $cfg{proxy} =~ /on|yes|true|1/) {
+#          print "Alias $$hostrec_ref{'alias'} matched by proxy-off-filter '$cfg{proxy_filter}'\n";
+           print "Proxy connection is disabled by proxy-filter option for this host\n";
+        }
+        # disable proxy for matched aliases 
+        $cfg{proxy} = 'false';
+
+        if (defined $cli{proxy_host} ) {
+           if ( $cfg{proxy_default} !~ /cli/) {
+              print "Proxy seting can be manually overwritten only when 'proxy_default = cli' \n";
+              print "Verify settings with --list-proxy option\n";
+              exit ;
+           }
+           print "Proxy connection is forced by a cli option\n";
+           #print "CLI defined $cli{proxy_host} \n";
+           $cfg{proxy} = 'on';
+        }
+
+     }
+ 
+     if ( defined $cfg{proxy} && $cfg{proxy} =~ /on|yes|true|1/ && ! defined $op{op_noproxy} ){
+
+        my $proxy_url;
+
+        while(1){
+
+           # GLOBAL SETTINGS #
+           # --------------- #
+           # if no per record configuration - use default proxy form config if exist
+           if (defined $cfg{proxy_host} and 
+               defined $cfg{proxy_port}){
+              $proxy_url = "$cfg{proxy_host}:$cfg{proxy_port}";
+           }
+           last if $cfg{proxy_default} =~ /config/;
+
+           # RECORD SETTINGS #
+           # --------------- #
+           # if host and port - set both
+           if (defined $$hostrec_ref{extra}{proxy_host} and 
+               defined $$hostrec_ref{extra}{proxy_port}){
+              $proxy_url = "$$hostrec_ref{extra}{proxy_host}:$$hostrec_ref{extra}{proxy_port}";
+           }
+           # if no host value - set default host to localhost
+           #elsif (! defined $$hostrec_ref{extra}{proxy_host} and 
+           #         defined $$hostrec_ref{extra}{proxy_port}){
+           #    $proxy_url = "127.0.0.1:$$hostrec_ref{extra}{proxy_port}";
+           #}
+           # if host and no port - try default ports for proxy_type
+           elsif ( defined $$hostrec_ref{extra}{proxy_host} and 
+                  ! defined $$hostrec_ref{extra}{proxy_port}){
+                 $proxy_url = "$$hostrec_ref{extra}{proxy_host}:$proxy_port{$$hostrec_ref{extra}{proxy_type}}";
+           }
+           last if $cfg{proxy_default} =~ /db/;
+
+           # USER/CLI SETTINGS #
+           # ----------------- #
+           # if host and bport - use both 
+           if (defined $cli{proxy_host} and 
+               defined $cli{proxy_port}){
+              $proxy_url = "$cli{proxy_host}:$cli{proxy_port}";
+           }
+           # if host and no port - set default port 
+           elsif (defined $cli{proxy_host} and 
+                  ! defined $cli{proxy_port}){
+              $proxy_url = "$cli{proxy_host}:$proxy_port{$cli{proxy_type}}";
+           }
+           last if $cfg{proxy_default} =~ /cli/;
+        }
+
+        # NETCAT BACKAND 
+	     if (&backend_nc($cfg{exec_nc})){
+
+           # proxy_type  : http / socks [45]
+           my $socks_ver = ''; 
+           if (defined $cfg{proxy_type}){
+              if ($cfg{proxy_type} =~ /socks/)  { $socks_ver = '-X 5'; } 
+              if ($cfg{proxy_type} =~ /socks4/) { $socks_ver = '-X 4'; } 
+              if ($cfg{proxy_type} =~ /socks5/) { $socks_ver = '-X 5'; } 
+              if ($cfg{proxy_type} =~ /http/)   { $socks_ver = '-X connect'; } 
+           }
+           if (defined $$hostrec_ref{extra}{proxy_type}){
+              if ($$hostrec_ref{extra}{proxy_type} =~ /socks/)  { $socks_ver = '-X 5'; } 
+              if ($$hostrec_ref{extra}{proxy_type} =~ /socks4/) { $socks_ver = '-X 4'; } 
+              if ($$hostrec_ref{extra}{proxy_type} =~ /socks5/) { $socks_ver = '-X 5'; } 
+              if ($$hostrec_ref{extra}{proxy_type} =~ /http/)   { $socks_ver = '-X connect'; } 
+           }
+           if (defined $cli{proxy_type}){
+            
+              if ($cli{proxy_type} =~ /socks/)  { $socks_ver = '-X 5'; } 
+              if ($cli{proxy_type} =~ /socks4/) { $socks_ver = '-X 4'; } 
+              if ($cli{proxy_type} =~ /socks5/) { $socks_ver = '-X 5'; } 
+              if ($cli{proxy_type} =~ /http/)   { $socks_ver = '-X connect'; }
+           }
+
+           #print "Found netcat supporting proxy connections.\n";
+           if ($proxy_url){
+               $cfg{proxycommand}{socks_ver} = $socks_ver ;
+               $cfg{proxycommand}{proxy_url} = $proxy_url ;
+               $$hostrec_ref{extra}{proxycommand} = "$cfg{exec_nc} $socks_ver -x $proxy_url \%h \%p";
+           }
+           else {
+              print "WRR :: No proxy url found . Disabling tunneling for this connection !\n";
+              $cfg{proxy} = 'off';
+           }
+           #print "ProxyCommand='$$hostrec_ref{extra}{proxycommand}'\n";
+
+        }
+         else {
+            print "Found netcat not supporting proxy. Please install netcat-openbsd.\n";
+            exit 1;
+	     }
+        
+        # set ssh argument for tunnel connection
+        if (defined $$hostrec_ref{extra}{proxycommand}  && ! defined $op{op_kssh}    ){
+           push @{$sshdata{master_opts}} , "-o" ;
+           push @{$sshdata{master_opts}} , "ProxyCommand $$hostrec_ref{extra}{proxycommand}" ;
+        }
+        #dump %sshdata; 
+
+     }
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+ 
+
+
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # ssh vpn (root required on both side - server and client) 
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     #if (defined $op{op_tun}){
+     #
+     #} 
+
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # port knocking 
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     if (defined $op{op_knocker}){
+        &knocker( $$hostrec_ref{'host'} );
+        exit 0;
+     }
+
+     if (defined $op{op_kssh}){
+        my @kp;
+        if ( $op{op_kssh} eq ''  ){
+           if (defined $$hostrec_ref{extra}{knock_ports} ){
+              foreach my $p  (@{$$hostrec_ref{extra}{knock_ports}}){
+                 if ($p =~ /^[0-9]+$/ && $p <= 65535 ){
+                    push @kp, $p;
+                 }
+                 else {
+                    print "Bad format - port1,port2,..,portN or port ".
+                                         "outside a scope 0-65535.\n";
+                    exit 1;
+                 }
+              };
+              #print "Knock ports: \n";
+              #dump @kp;
+           }
+           elsif (defined $cfg{knock_seq}) {
+              foreach my $p  (@{$cfg{knock_seq}}) {
+                 if ($p =~ /^[0-9]+$/ && $p <= 65535 ){
+                    push @kp, $p;
+                 }
+                 else {
+                    print "Bad format - port1,port2,..,portN or port ".
+                                         "outside a scope 0-65535.\n";
+                    exit 1;
+                 }
+              };
+           }
+           else {
+              print "ERR :: No record specific ports and missing option argument.\n";
+              exit 1;
+           }
+
+        }
+        elsif ( $op{op_kssh} =~ /^[0-9]+/ ) {
+           foreach my $p ( split /,/,$op{op_kssh}  ){
+              if ($p =~ /^[0-9]+$/ && $p <= 65535 ){
+                 push @kp, $p;
+              }
+              else {
+                 print "Bad format - port1,port2,..,portN or port ".
+                                       "outside a scope 0-65535.\n";
+                 exit 1;
+              }
+           }
+           #print "Knock ports: $op{op_kssh}\n";
+           #dump @kp;
+
+        }
+        else {
+           print "ERR :: No record specific ports or missing option argument.\n";
+           exit 1;
+        
+        }
+
+        #prompting#line#
+        if ( defined $cfg{proxy} && $cfg{proxy} =~ /on|yes|true|1/ && ! defined $op{op_noproxy} ) {
+            $CL[1] = 'BOLD GREEN';
+            print eval $CL[1],prl($LU-15,'-').' (',eval $CL[0],"via proxy", eval $CL[1],") --\n";
+        }
+        else {
+            print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n";
+        }
+        ################
+
+        if (scalar @kp) {
+
+           $cfg{kssh_verb} = 1;
+
+           #print "VERB: $cfg{kssh_verb}\n";
+           #print "PROXY:  $cfg{proxycommand}\n" if (defined $cfg{proxycommand} );
+
+           if (defined $cfg{proxycommand} ){
+              # proxy
+              #print "NC: $cfg{proxycommand}{socks_ver} - $cfg{proxycommand}{proxy_url} \n";
+              if (! $cfg{kssh_verb}){
+                 print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking ... ";
+                 my $ncknock = "timeout 1 $cfg{exec_nc} -z -w1 ".
+                                  "$cfg{proxycommand}{socks_ver} ".
+                                  "-x $cfg{proxycommand}{proxy_url}  %h ". 
+                                  join "; timeout 1 $cfg{exec_nc} -z -w1 ".
+                                       "$cfg{proxycommand}{socks_ver} ".
+                                       "-x $cfg{proxycommand}{proxy_url} %h ", @kp; 
+                 push @{$sshdata{master_opts}} , "-o" ;  
+                 push @{$sshdata{master_opts}} , "ProxyCommand sh -c '$ncknock ;".
+                                                 "$cfg{exec_nc} $cfg{proxycommand}{socks_ver} ".
+                                                 "-x $cfg{proxycommand}{proxy_url} %h %p '" ;
+              }
+              else {
+                  foreach my $p (@kp) {
+                     print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking > $p ... ";
+
+                     my $command = "timeout 1 $cfg{exec_nc} -v -z -w1 ".
+                            "$cfg{proxycommand}{socks_ver} ".
+                            "-x $cfg{proxycommand}{proxy_url}  $$hostrec_ref{'host'} $p";
+                     #print "$command";
+
+                     open (EX,"$command 2>&1 |") 
+                        or die "Couldn't execute netcat: $!\n";
+                     my $retline = <EX> || 'success';
+                     close EX;
+
+                     if ($retline =~ /failed/){
+                        ###########
+                        print "\rERR:: Knocking port: $p : failed ! Verify your proxy connection. \n";
+                        $CL[1] = 'BOLD GREEN';
+                        print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n";
+                        ###########
+                        exit 1;
+                     }
+                  }                 
+                  push @{$sshdata{master_opts}} , "-o" ;
+                  push @{$sshdata{master_opts}} , "ProxyCommand ".
+                                                  "$cfg{exec_nc} $cfg{proxycommand}{socks_ver} ".
+                                                  "-x $cfg{proxycommand}{proxy_url} \%h \%p " ;
+              }
+           }
+           else {
+              # no-proxy
+              if (! $cfg{kssh_verb}){
+
+                 print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking  ... ";
+                 my $ncknock = "$cfg{exec_nc} -z -w1 %h " . 
+                      join ";$cfg{exec_nc} -z -w1 %h ", @kp; 
+                 push @{$sshdata{master_opts}} , "-o" ;  
+                 push @{$sshdata{master_opts}} , "ProxyCommand sh -c '$ncknock;$cfg{exec_nc} %h %p'" ;
+              }
+              else {
+                 foreach my $p (@kp) {
+                     print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking > $p ... "; 
+
+                     my $command = "timeout 1 $cfg{exec_nc} -v -z -w1 ".
+                            " $$hostrec_ref{'host'} $p";
+
+                     open (EX,"$command |") 
+                        or die "Couldn't execute netcat: $!\n";
+                     close EX;
+                 } 
+              }
+           }
+        }
+        #dump  %sshdata;
+        #exit ;
+     } 
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # local/remote port forwarding 
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     if (defined $op{op_pfloc} || defined $op{op_pfrem}){
+
+        #print " $op{op_pfloc}\n" if defined $op{op_pfloc};
+        #print " $op{op_pfrem}\n" if defined $op{op_pfrem};
+
+        my @frwds = ();
+
+        push @frwds , "-L ".$op{op_pfloc} if defined $op{op_pfloc}; 
+        push @frwds , "-R ".$op{op_pfrem} if defined $op{op_pfrem};
+
+        #dump @frwds; 
+
+        foreach my $forwarder (@frwds){
+
+           my $bindaddr;
+           my $localport;
+           my $hostport;
+           my $host;
+           my $type;
+           my $cfgtype; 
+      
+           $cfgtype = 'local'  if $forwarder =~ /-L/;
+           $cfgtype = 'remote' if $forwarder =~ /-R/;
+
+           #print "F:$forwarder\nC:$cfgtype\n";
+
+           if ($forwarder =~ /^-(L|R) ((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+              #print "$1 - $2 - $3 - $4 - $5 - $6 \n";
+              $type      = $1;
+              $bindaddr  = $3 || '127.0.0.1';
+              $localport = $4;
+              $host      = $5 || '127.0.0.1';
+              $hostport  = $6; 
+
+              #print " -$type  $bindaddr:$localport:$host:$hostport\n";
+#              if ($localport < 1024){
+#                 if ($> == 0){
+#                    print "WRR :: You should not use port number below 1024 even when you got root!\n";
+#                 }
+#                 else {
+#                    print "ERR :: You (id:$>) are not allowed to use port number below 1024.\n";
+#                    exit 1;
+#                 }
+#              }
+
+           }
+           elsif ($forwarder =~ /^-(L|R) $/ ) {
+              $type = $1;
+              if (defined  $$hostrec_ref{extra}{$cfgtype}){
+                 if ($$hostrec_ref{extra}{$cfgtype} =~ /^((.*):)?([0-9]+):(.*)?:([0-9]+)$/){
+                    #print "$1 - $2 - $3 - $4 - $5 - $6 \n";
+                    $bindaddr  = $2 || '127.0.0.1';
+                    $localport = $3;
+                    $host      = $4 || '127.0.0.1';
+                    $hostport  = $5; 
+                 }
+                 else {
+                    print "Bad record format [$alias] - localport:[hostname]:hostport\n";
+                    exit 1;
+                 }
+              }
+              else {
+                 print "No $cfgtype port forwarders defined in record. ".
+                       "You need to specify an argument.\n";
+                 exit;
+              }
+           }
+           else {
+              print "Bad format - localport:[hostname]:hostport\n";
+              exit 1;
+           }
+
+
+           my $exec = &find_cmd('ssh');
+           my @params = (
+              "-$type",
+              "$bindaddr:$localport:$host:$hostport",
+              "-o NumberOfPasswordPrompts=1",
+              "-o PubkeyAuthentication=no",
+              "-o PreferredAuthentications=keyboard-interactive,password",
+              "-o UserKnownHostsFile=/dev/null",
+              "-o StrictHostKeyChecking=no",
+              "-o ExitOnForwardFailure=yes",
+#              "-M -S /tmp/%h.sock",
+              "-fC2qN",
+#              "-fNT",
+              "$$hostrec_ref{user}\@$$hostrec_ref{host}",
+              "-p$$hostrec_ref{port}" ,
+             '-v',
+           );
+
+
+           if (defined $cfg{proxycommand}){
+              print "Sorry! Currently port forwarding is not supported via proxy.\n";
+              print "If you have globally enabled proxy, try with --no-proxy option. \n";
+              exit 1;
+                
+              push @params , "-o 'ProxyCommand $cfg{exec_nc} $cfg{proxycommand}{socks_ver} ".
+                               "-x $cfg{proxycommand}{proxy_url} \%h \%p '" ;
+
+           }
+
+           my $cmdargs = $exec ." ". join " ", @params;
+           #print ">> $cmdargs\n";
+           # first check if simillar process exists 
+           my $rps_ref =  &psfind($cmdargs);
+           if (scalar keys %{$rps_ref}) {
+               print "WRR :: It looks like there is already running similar ssh process \n";
+ 
+               foreach my $pid (sort keys %{$rps_ref}) {
+                  chomp $$rps_ref{$pid};
+                  printf "| %7s | %62s .. |\n", $pid , substr $$rps_ref{$pid},0,62;
+               }
+               exit 1;
+           }
+           ########################################
+           # next check if port is available
+           if (&checkport('127.0.0.1',$localport)){
+              print "Port ($localport) is not available. ";
+
+              if (my $fport = get_freeport('127.0.0.1',$localport)){
+                 print "Found free port : $fport \n";
+                 print "You can get list of running tunnels with '--list-pf'.\n";
+              }
+              else {
+                 print "\n";
+                 exit 1;
+              }
+              exit 1;
+           }
+ 
+#dump %sshdata; 
+#  &sshexec2($cfgtype,$$hostrec_ref{host},\%sshdata);
+#exit;
+           my $exp_pid = &sshexec($cfgtype,$exec,\@params,$$hostrec_ref{pswd});
+  
+           # get pid of spawn process #############
+           # expect does not return pid of spawn process only pid 
+           # of his (expect) process but child process 'should be'
+           # just one higher
+
+           $rps_ref =  &psfind($cmdargs);
+
+           $cfgtype =~ s/l/L/;
+           $cfgtype =~ s/r/R/;
+
+           if (scalar keys %{$rps_ref}) {
+              print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , 
+                "$cfgtype Port forwarding with $$hostrec_ref{host} : $localport:$host:$hostport ... \n";
+              print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+
+              # print all ssh processes with this same setting from ps
+              foreach my $pid (sort keys %{$rps_ref}) {
+                 chomp  $$rps_ref{$pid};
+                 printf "| %7s | %62s .. |\n", $pid , substr $$rps_ref{$pid},0,62;
+              }
+  
+              my @last = sort keys %{$rps_ref};
+              #print "oldest pid: $last[$#last]\nexpect pid: $exp_pid\n";
+              if ( $exp_pid + 1  eq $last[$#last]  ) {
+                 print "$last[$#last] looks like child of expect process ($exp_pid)\n" if $op{op_dbg};
+              }
+           }
+           else {
+              print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , 
+                "Sorry! Tunnel with $$hostrec_ref{host} not set ! \n";
+              print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+           }
+
+        }#for
+     
+        exit 0;
+     } 
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # dynamic port forwarding - set socks
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     
+     if (defined $op{op_socks}){
+
+        my $port     = $$hostrec_ref{extra}{socks_port} || $proxy_port{socks};
+        my $bindaddr = $$hostrec_ref{extra}{socks_bind} || '127.0.0.1';
+
+        if ($op{op_socks} =~ /^((.*):)?([0-9]+)$/){ 
+           #print $op{op_socks}."\n"; 
+           # print "$1 - $2 - $3\n";
+           $bindaddr = $2 || '127.0.0.1';
+           $port     = $3;
+        }
+        #print "-D $bindaddr:$port\n";
+        if ($port < 1024) {
+           if ($> == 0){
+              print "WRR :: You should not use port number below 1024 even when you got root!\n";
+           }
+           else {
+              print "ERR :: You (id:$>) are not allowed to use port number below 1024.\n";
+              exit 1;
+           }
+        }
+
+        my $exec = &find_cmd('ssh');
+        my @params = (
+           "-D", 
+           "$bindaddr:$port",
+           "-o NumberOfPasswordPrompts=1",
+           "-o PubkeyAuthentication=no",
+           "-o PreferredAuthentications=keyboard-interactive,password",
+           "-o UserKnownHostsFile=/dev/null",
+           "-o StrictHostKeyChecking=no",
+           "-fC2qN",  
+           "$$hostrec_ref{user}\@$$hostrec_ref{host}", 
+           "-p$$hostrec_ref{port}" ,
+           '-v'
+        );
+        my $cmdargs = $exec ." ". join " ", @params;
+        #print ">>$cmdargs\n";
+        # first check if simillar process exists 
+        my $rps_ref =  &psfind($cmdargs);
+        if (scalar keys %{$rps_ref}) {
+            print "WRR :: It looks like there is already running similar ssh process \n";
+
+            foreach my $pid (sort keys %{$rps_ref}) {
+               chomp $$rps_ref{$pid};
+               printf "| %7s | %62s .. |\n", $pid , substr $$rps_ref{$pid},0,62;
+            }
+            exit 1;
+        }
+        # next check if port is available
+        if (&checkport('127.0.0.1',$port)){
+           print "Port ($port) not available. ";
+
+           if (my $fport = get_freeport('127.0.0.1',$port)){
+              print "Found free port : $fport \n";
+              print "You can get list of running tunnels with '--list-socks'.\n";
+           }
+           else {
+              print "\n";
+              exit 1;
+           }
+           exit 1;
+        }
+
+        my $exp_pid = &sshexec('dynamic',$exec,\@params,$$hostrec_ref{pswd});
+  
+        # get pid of spawn process 
+        # expect does not return pid of spawn process only pid 
+        # of his (expect) process but child process 'should be'
+        # +1
+        $rps_ref =  &psfind($cmdargs);
+
+        if (scalar keys %{$rps_ref}) {
+           print cll . eval $CL[1],"\rASSH3 :: ",eval $CL[0] , 
+                "Tunnel with $$hostrec_ref{host} set on $port ... \n";
+           print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+
+           # print all ssh processes with this same setting from ps
+           foreach my $pid (sort keys %{$rps_ref}) {
+              chomp  $$rps_ref{$pid};
+              printf "| %7s | %62s .. |\n", $pid , substr $$rps_ref{$pid},0,62;
+           }
+  
+           my @last = sort keys %{$rps_ref};
+           #print "oldest pid: $last[$#last]\nexpect pid: $exp_pid\n";
+              if ( $exp_pid + 1  eq $last[$#last]  ) {
+                 print "$last[$#last] looks like child of expect process ($exp_pid)\n" if $op{op_dbg};
+              }
+        }
+        else {
+           print cll . eval $CL[1],"\rASSH3 :: ",eval $CL[0] , 
+                "Sorry! Tunnel with $$hostrec_ref{host} not set ! \n";
+           print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+        }
+	     exit 0;     
+     }
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     # session logging
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+     if ($op{op_slog}){
+
+        #if ($cfg{tooltips} eq 'on' and not defined $op{op_quiet} ){
+        print prl($LU,'-').$/;
+        print <<EOF;
+: Session logging is experimental !!!                                          :
+: Currently only full session logging is supported. This means that both STDIN : 
+: and STOUT is logged and it is very likely that it creates giant log files    :
+: Try to use this option with caution.                                         :
+EOF
+        print prl($LU,'-').$/;
+        #}
+     }
+
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+     ### NET::OPENSSH                                                        ###
+     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+
+
+     if ( defined $cfg{proxy} && $cfg{proxy} =~ /on|yes|true|1/ && ! defined $op{op_noproxy} ) {
+        #$CL[1] = 'BOLD YELLOW';
+        $CL[1] = 'BOLD GREEN';
+        #$CL[1] = 'BOLD CYAN';
+        print eval $CL[1],prl($LU-15,'-').' (',eval $CL[0],"via proxy", eval $CL[1],") --\n"  if ! defined $op{op_kssh};
+        print &cll;
+        print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "connecting (via proxy) ... ";
+        print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking before connecting (via proxy) .. " 
+           if defined $op{op_kssh} && ! $cfg{kssh_verb} ;
+     }
+     else {
+        print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n"  if ! defined $op{op_kssh};
+        print &cll;
+        print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "connecting ... ";
+        print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "knocking before connecting .. " 
+           if defined $op{op_kssh} && ! $cfg{kssh_verb};
+     }
+     my $ssh = Net::OpenSSH->new($$hostrec_ref{'host'}, %sshdata);
+     if ($ssh->error){
+        print "\rERROR :: Couldn't establish SSH connection to $$hostrec_ref{'host'}:\n".
+              $ssh->error ."\n";
+
+        print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+        exit 1;
+     }
+     my ($pty, $pid) = $ssh->open2pty({stderr_to_stdout => 1},'bash','-l','-i' );
+     if ($ssh->error){
+        print "\rERROR :: Unable to start remote shell: " . $ssh->error;
+        print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+        exit 1;       
+     }
+     print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , 
+         "Establishing connection with [$$hostrec_ref{'alias'}] $$hostrec_ref{'host'} at $$hostrec_ref{'port'} \n";
+
+     ###############################
+     ## Expect                    ##
+
+     my $exp = Expect->init($pty);
+
+     ## LOGSESSION - EXPERIMENTAL ##
+     if ($op{op_slog}){
+        my $logfile = "$alias-".time()."-stdout.log";
+        $exp->log_file("$cfg{logdir}/$logfile");
+     }
+     ###############################
+
+     ### solution for winsize
+     $exp->slave->clone_winsize_from(\*STDIN);
+     $SIG{WINCH} = \&winch;
+     sub winch {
+         no warnings;
+         $exp->slave->clone_winsize_from(\*STDIN);
+         kill WINCH => $exp->pid if $exp->pid;
+         $SIG{WINCH} = \&winch;
+     }
+     ### end solution
+
+
+     # SU USER ( second user )
+     if ($lev == '2' && ! defined $op{op_suuser} ) {
+       $op{op_autl} = 1 if ($cfg{suenv} =~ /on/);
+       if (defined $op{op_autl}) { 
+          $exp->send("LANG=C su - $$hostrec_ref{'user2'}\n");  
+       }
+       else { 
+          $exp->send("LANG=C su $$hostrec_ref{'user2'}\n"); 
+       }
+       $exp->expect(100, [ qr/[pP]assword:/ => sub {  $exp->send("$$hostrec_ref{'pswd2'}\n"); } ] );
+     }
+
+     #temporarly solution for duplicated expect cmd sending before prompt 
+     if ($lev == '1') {
+        #sleep (0.4);
+        #$exp->expect(1);
+        $exp->expect(10, [ qr/[\$#]/ => sub { ; } ] );
+        if (not defined $cfg{defcmd}) {
+           $exp->send("\n");
+        }
+     }
+
+     # set title ugly hack 
+     $exp->send("[[ \$TERM == 'xterm' ]] && export PS1=\"\\[\\e]0;[\\h]\\a\\]\$PS1\" \n") if defined $op{op_xterm};
+
+     # execute defined commands / deprecated 
+     if (defined $cfg{defcmd}) {
+        $exp->send("$cfg{defcmd}\n");
+     }
+     if ( @xcmds) {
+       foreach (@xcmds){
+          my $x = "cmd$_";
+          $exp->send("$cfg{$x}\n");
+       }
+     }
+
+     # clear screen 
+     # $exp->send("clear\n");
+
+     # if $rcmd then run command before interact
+    
+     $stay = 1 if defined $op{op_nologout};
+     if ($rcmd && $stay ) {
+        # sleep needed for some slow machine
+        sleep($sleeptime);
+        $exp->send("$rcmd\n");
+        print ("ASSH3 :: Executing remote command .. \n");
+        #print ("$rcmd\n");
+     }
+     ##################################################################
+     if ($rcmd && not $stay ) {
+        # sleep needed for some slow machine
+        sleep ($sleeptime);
+        # $exp->slave->stty(qw(raw -echo));
+        $exp->send("$rcmd\n");
+        # leave su - $user2 level          
+        $exp->send("exit\n") if ($lev == '2');
+        # leave shell 
+        $exp->send("logout\n");
+        $exp->interact();
+        print eval $CL[1],prl($LD,'-')," $footer\n",eval $CL[0] ;
+     } 
+     ##################################################################
+     else {
+       print eval $CL[1],prl($LD,'-')," $footer\n",eval $CL[0] ;
+       # go to interact
+       $exp->interact();
+     }
+     ##
+     print "\nASSH3 :: Connection closed.\n";
+
+}
+
+# -----------------------------------------------------------------------------
+# pSSH - ssh parallel execute - execute and disconnect
+# -----------------------------------------------------------------------------
+
+sub pSSH {
+
+     my ($alias_regex, $rcmd , $mode ) = @_;
+     my @hosts        = ();
+     my %multihostrec = ();
+     my $pwddb_aliases_ref;
+
+     # SET TEMORARLY LINK BETWEN PARALLEL AND SERIAL MODE 
+     if ($mode eq 'parallel') { 
+        $mode = 'serial'; 
+        print "ASSH3 :: Parallel mode is currently not available. Changing to serial. \n";
+     }
+
+     #print " ".eval $CL[2],prl(55,'_').'__ ASSH serial mode __', eval $CL[0],"\n";
+     print " ".eval $CL[2],prl(55,' ')."ASSH $mode mode", eval $CL[0],"\n";
+     
+     # get list of aliases from pwddbfile 
+
+     if (defined $op{op_aliases} && ! defined  $op{op_hosts}){
+        $pwddb_aliases_ref = gpgpwdman(\%cfg,$cfg{passwdb},'getaliases','');
+     }
+     elsif (defined $op{op_hosts} && ! defined  $op{op_aliases}){
+        $pwddb_aliases_ref = gpgpwdman(\%cfg,$cfg{passwdb},'gethosts','');
+     }
+     else {
+        $pwddb_aliases_ref = gpgpwdman(\%cfg,$cfg{passwdb},'getalihos','');
+     }
+
+     #print "@$pwddb_aliases_ref\n"; 
+     # dump $pwddb_aliases_ref;
+    
+     for(@$pwddb_aliases_ref) {
+        push @hosts, $_ if ($_ =~ /($alias_regex)/); 
+     }
+     
+     # search duplicated value - can occur with multidb in use
+     # remove and return them 
+     sub remove_duplicates(){
+        my $ar = shift;
+        my %seen;
+        my @dup;
+        for ( my $i = 0; $i <= $#{$ar} ; ){
+            # gdy znajdzie drugie wystapienie elementu , usuwa go 
+            # ale pierwszy element pozostaje 
+            if ($seen{$ar->[$i++]}++) { 
+               push @dup, $ar->[$i-1];   
+               #print "X: $i - ". $ar->[$i] ."\n";
+               splice @$ar, --$i, 1;
+            }
+         }
+         #dump %seen;
+         #dump $ar;
+         return \@dup;
+     }  
+
+     # search and removes duplicates (duplicates are removed but first 
+     # occurance is kept 
+     my $dup =  &remove_duplicates(\@hosts);
+
+     # inform about duplicated aliases from multidbs
+     if (@$dup) {
+
+        print ' '.prl ($LU-2,'-').$/;
+        if ($cfg{tooltips} eq 'on' and not defined $op{op_quiet} ){
+
+           print <<EOF;
+: Duplicated aliases were found !                                              :
+: ---------------------------------------------------------------------------- :
+: You will have a chance to solve ambiguities and choose database with desired :
+: record or remove all aliases that were duplicated from processing lists.     : 
+:                                                                              :
+: You can also specify a specific database using a '-d' switch. See assh -man  :
+: to get more about this.                                                      :
+EOF
+           print ' '.prl ($LU-2,'-').$/;
+        }
+        print " Found duplicated records: ". scalar @{$dup} ." \n";
+
+        my $s = 0; 
+        my $line = 79;
+        print ' ';
+        foreach my $m (@{$dup}){
+           #my $mlen = length $m; 
+           my $mlen = 18;
+           if ($line%($s+$mlen+1) < $line) {
+              printf "%-${mlen}s ",$m ; 
+              $s += $mlen + 1;
+           }
+           else { 
+              printf "\n %-${mlen}s ",$m ; 
+              $s = $mlen + 1;
+           }
+        }
+ 
+        print "\n ".prl ($LU-2,'-').$/;
+
+
+        print ": 1 : Solve the ambiguity\n".
+              ": 2 : Remove duplicates (from processing)\n";
+        while(1){
+           print "Your choose [1-2]: ";
+           $| = 1;               # force a flush after our print
+           my $line = <STDIN>;
+           chomp $line;
+           #$| = 1;              # force a flush after our print
+           $line =~ s/[nrft]//g;
+           $line =~ s/^\s+|\s+$//g;    # trim right and left whitespaces
+           if ( $line =~ /^1$/ ) {
+              #print "Solving ambiguity";
+              #sleep 1;
+              #print $/;
+              last;
+           }
+           elsif ($line =~ /^2$/ ) {
+              # remove elements of @hosts which exists in @dup
+              #dump @hosts; dump $dup;      
+
+              my @del_indexes; 
+              foreach my $ralias (@$dup){
+                 push @del_indexes, reverse(grep { $hosts[$_] eq $ralias } 0..$#hosts);
+              }
+
+              # remoces duplicate usunela kolejne powtorzenia ale zostaly pierwsze 
+              # teraz znajac nazwy elementow znajduemy ich indes i uswamy je rowniez 
+              # tzn 2 removes duplicate usuwa zlisty wszystkie elementy ktore mialy duplicat 
+
+              for(my $i=0;$i<@del_indexes;$i++) {
+                splice (@hosts,$del_indexes[$i]-$i ,1);
+              }
+              #my $x=0; foreach (@hosts) { print $x++ . ' - ' . $_ .$/ };
+              #dump @hosts; dump $dup; dump @del_indexes;     
+              print "Duplicates were removed\n";
+              last;
+           }
+        }
+     }
+
+     # build multirec hash of hash
+     # multirec = ( '$alias' => ( 'alias' => $alias, host => 'IP', port => 'PORT' ... ), )
+     # dump @hosts;
+
+     my @sbar = qw[ / - \ | * ]; my $i =0;
+     foreach my $alias (@hosts){
+        print "\rProcessing databases  ". $sbar[$i++ % @sbar]; 
+        $multihostrec{$alias} = &get_record(
+           gpgpwdman(\%cfg,$cfg{passwdb},'search', $alias), 
+           $alias
+        );
+     }
+     # dump %multihostrec;
+     # dump @dup;
+
+     
+     if ($#hosts < 0){
+        print "\rERROR ::  No hosts ($#hosts) were specified or bad expression was used.\n";
+        exit (1);
+     }
+
+     if ($op{op_dec}){
+        print "\rYou're going to display multiple records with passwords from [ ", 
+              eval $CL[4],scalar @hosts ,eval $CL[0], " ] hosts.\n";
+        print eval $CL[2],prl($LU,'-').$/ ,eval $CL[0];
+     }
+     else {
+        print "\rYou're going to remotly execute commands on [ ", 
+              eval $CL[4],scalar @hosts ,eval $CL[0], " ] hosts.\n";
+        print eval $CL[2],prl($LU,'-').$/ ,eval $CL[0];
+     }
+
+
+
+      my $s = 0; 
+      my $line = 80;
+      foreach my $m (@hosts){
+         #my $mlen = length $m; 
+        my $mlen = 19;
+        if ($line%($s+$mlen+1) < $line) {
+          printf "%${mlen}s ",$m ; 
+          $s += $mlen + 1;
+        }
+        else { 
+          printf "\n%${mlen}s ",$m ; 
+          $s = $mlen + 1;
+        }
+      }
+      print $/;
+ 
+
+#     print eval $CL[2],prl($LU,'-'),eval $CL[0],"\n" ;
+#     print " $hosts[0]\t";
+#     for (my $i=1; $i<=$#hosts; $i++){ 
+#        print $hosts[$i]."\t"; 
+#        print "\n " unless( $i%8 ); 
+#     }
+#	  print "\n"; 
+
+
+
+     print eval $CL[2],prl($LU,'-'),eval $CL[0],"\n" ;
+
+     if ($op{op_dec}){
+        if ($cfg{tooltips} eq 'on' and not defined $op{op_quiet} ){
+           print ' '.prl ($LU-2,'-').$/;
+           print <<EOF;
+: Are you sure you want to display cleartext passwords for multiple hosts      :
+: at once. If yes, see if your screen is not monitor by someone eyes, also     :
+: be aware that a lot of terminals use scrollback buffers in temporarly files. :
+: Remember to clear this buffers.                                              :
+EOF
+           print ' '.prl ($LU-2,'-').$/;
+        }
+        print "You need to confirm this operation [yes/No]? ";
+     }
+     else {
+        print "Are you sure command you are trying to use is secure [yes/No]? ";
+     }
+     if ( <STDIN> !~ /^yes\s/ ) {
+        die "Ok! Good decision if you're not sure. \n"
+     }
+     my $TRK = 0 ; 
+     if ( eval { require Term::ReadKey; Term::ReadKey->import(); 1; } ) {
+        $TRK = 1 ;
+     }
+     else {
+        print "Warning: Missing Term::ReadKey module.\n";
+        $TRK = 0; 
+        qx(stty -echo);
+     }
+
+     if (defined $cfg{passphrase} && $cfg{passphrase} ne '') {
+        #  New md5 passphrase can be generated by below command:
+        #  perl -MDigest::MD5 -e 'print Digest::MD5->new->add(YOUR_PASSPHRASE_HERE)->hexdigest;
+        #  echo -n YOUR_PASSPHRASE_HERE | openssl md5
+
+        print "Please confirm your decision [passphrase] : ";
+        ReadMode('noecho') if $TRK;
+        chomp(my $confirm = $TRK ? ReadLine(0) : <STDIN>);
+        ReadMode('restore') if $TRK;
+
+        qx(stty echo) if not $TRK;
+      
+        my $digest = Digest::MD5->new->add($confirm)->hexdigest;
+        print "\nDigest is: '$digest'\n  your is: '$cfg{passphrase}'\n" if defined $op{op_dbg};
+
+        if ($cfg{passphrase} ne $digest) {
+           print  "\nDenied ! No passphrase confirmation.\n";  exit 0; 
+        }
+     }
+
+     print "\n... \n"; 
+
+
+     # sSSH - SERIAL MODE 
+     if ($mode eq 'serial') { 
+
+         for (my $alias =0; $alias <= $#hosts; $alias++) {
+            #foreach my $alias (@hosts) {
+            #print "ALIAS:$alias:\n";
+	         #dump $multihostrec{$alias} ;
+            print eval $CL[1],"Processing [ $hosts[$alias] ] [ $alias/". scalar @hosts ." ] .. \n",
+                  eval $CL[0] if (not defined $op{op_dec});
+	         asshlogin($multihostrec{$hosts[$alias]},$rcmd,0);
+         }
+
+     }
+     # pSSH - PARALLEL MODE 
+     # TODO : fork funtion
+     #
+     # jesli przez forki - dodac trzeba bedzie logowanie expecta do osobnego pliku 
+     #
+     elsif ($mode eq 'parallel'){
+        print "ASSH3 :: Real parallel mode is currently not available \n";
+     }
+     #####
+}
+
+# ---------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+
+sub backend_curl {
+
+   # check supported  versions for specific protocol
+   my $exec  = $cfg{exec_curl}; #print $exec.$/;
+   my $proto = shift;
+
+   #print "$exec, $proto\n";
+
+   open (EX,"$exec -V 2>&1 |") || die "Failed to execute curl: $!\n";
+   my @out = <EX>;
+   close EX;
+   
+   foreach (@out) {
+      if (/$proto/ ){
+           return 1;
+       }
+   }  
+   return 0;
+
+}
+sub backend_ssh {
+
+   my $exec  = $cfg{exec_scp};
+   #my $proto = shift; 
+
+   if (-e $cfg{exec_scp}){
+      return 1;
+   }
+   else {
+      return 0;
+   }
+
+}
+
+# ---------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+sub curl_get {
+
+   my $addr  = shift ; 
+   my $proto = shift;
+   my $user  = shift;
+   my $pass  = shift;
+   my $dst   = shift;
+   my $idprv = shift;
+   my $idpub = shift;
+
+   my $exec  = $cfg{exec_curl};;
+   my $url   = "$proto://$addr";
+   my $extra_args = '';
+   my $userpass   = ''; 
+
+   $userpass = "$user:$pass" if ($user && $pass);
+   $userpass = "$user" if ($user && ! $pass);
+
+   # ------------------------------------------- #
+   if ( -e  "$dst") {
+      print "File '$dst' exists, replace it ? [y/N]: ";
+      if (<STDIN> !~ /yes|YES|[yY]/) {
+         print prl($LU,'-').$/ ; exit 1;
+      }
+   }
+   # ------------------------------------------- #
+
+   if ($proto =~ /scp/){
+      $extra_args = '-k';
+   }
+   if (defined $op{op_dbimpkeys}){
+      my @keys = split /[:,;]/, $op{op_dbimpkeys};
+      if (exists $keys[0] ) { 
+         if (-e $keys[0]){ 
+            $extra_args .= " --key $keys[0] ";
+         }
+      }
+      if (exists $keys[1] ) { 
+         if (-e $keys[1]){ 
+            $extra_args .= " --pubkey $keys[1] ";
+         }
+      }
+      # CURL odds : when used with keys argument -u user
+      # must have ':' (-u user:) at the and or you will be asked for 
+      # password, when not using keys and you are not providing
+      # passwords on command line you should use -u user 
+      # without ':' at the and , this is little confusing here 
+      
+      $userpass = "$user:" ;
+   }
+
+   if (defined $idprv ||  defined $idpub){
+      if (defined $idprv && -e $idprv ) { 
+            $extra_args .= " --key $idprv ";
+      }
+      if (defined $idpub && -e $idpub ) { 
+            $extra_args .= " --pubkey $idpub ";
+      }
+      $userpass = "$user:" ;
+   }
+
+   print "CURL: $exec -f -# -o $dst -u$userpass -0 $url  $extra_args\n" if $op{op_dbg};
+
+   print prl($LU,'-').$/ ;
+   # -f --fail = fail silently (no output at all) on server errors 
+   if ( open (EX,"$exec -f -# -o $dst -u$userpass -0 $url  $extra_args |") ){
+      close EX;
+      print prl($LU,'-').$/;
+      return 1;
+   }
+   else {
+      print "Failed to execute $exec: $!\n";
+      print prl($LU,'-').$/; 
+      exit 1;
+   }
+
+   print prl($LU,'-').$/ ; 
+   
+}
+# ---------------------------------------------------------------------------- #
+# scp_get()
+# ---------------------------------------------------------------------------- #
+sub scp_get {
+ 
+   my $path  = shift; 
+   my $proto = shift;
+   my $user  = shift;
+   my $pass  = shift;
+   my $dst   = shift;
+   my $host  = shift;
+   my $port  = shift || '22';
+   my $file  = shift;
+   my $exec  = $cfg{exec_scp};;
+
+   my $idpriv = shift;
+   my $idpub  = shift; 
+
+   if (defined $op{op_dbimpkeys}){
+      my @keys = split /[:,;]/, $op{op_dbimpkeys};
+      if (exists $keys[0] and exists $keys[1] ) { 
+         if (-e $keys[0]){ 
+            $idpriv = "$keys[0] ";
+         }
+         if (-e $keys[1]){ 
+            $idpub  = "$keys[1] ";
+         }
+      }
+      if (exists $keys[0] and not exists $keys[1] ) { 
+         if (-e $keys[0]){ 
+            $idpub  = "$keys[0] ";
+         }
+
+      }
+   }
+   my $identity = '';
+   #$identity = "-i $idpub" if $idpub;  
+   $identity = "-oIdentityFile=$idpub" if $idpub;  
+
+   # jesli nie ma pass sprawdz hosta w bazie hasel $$hostrec_ref{pswd} 
+   # if no pass in url and no keys ina --import-key argument we can look 
+   # for password in current database for host , else indentity key can be 
+   # set in user ~/.ssh/config 
+
+   if (! $pass && ! $identity) {
+      print prl($LU,'-')."\n";
+      print ": No password or key.  If you did not specified identity for this host in user :\n".
+            ": ~/.ssh/config you will be prompt for them if not found in current databases. :\n";
+      print prl($LU,'-')."\n";
+      # TODO : ADD PROMPT TO CONFIRM SEARCHING IN CURRENT DBS BEFORE SEARCH
+
+      if (my $record_ref = &get_record(gpgpwdman(\%cfg,$cfg{passwdb},'search',$host), $host)){
+#         dump $record_ref;
+         if ($$record_ref{user} eq $user) { $pass = $$record_ref{pswd}; }
+         if ($$record_ref{user2} eq $user){ $pass = $$record_ref{pswd2}; }
+      }
+   }
+
+   # ------------------------------------------- #
+   if ( -e  "$dst") {
+      print "File '$dst' exists, replace it ? [y/N]: ";
+      if (<STDIN> !~ /yes|YES|[yY]/) {
+         print prl($LU,'-').$/ ; exit 1;
+      }
+   }
+   # ------------------------------------------- #
+
+   # if dst is a file change to directory 
+   # no file as destination allowed with scp 
+   if (!-d $dst) {
+      use File::Basename;
+      $dst = dirname($dst);
+      #print $dst; 
+   }
+
+   # print ":: $path - $proto - $user - $pass - $dst - $idpriv - $idpub - $host - $port ::\n\n";
+   # scp -P 59122 -i ~/.assh/id_rsa_dbserver  bkzk@vps.bkzk.net:/home/users/bkzk/sxxpwd.gpg.new.gz .
+
+   my @params = (
+      "-v",
+      "-P$port",
+      "$identity",
+      "-p",  
+      "$user\@$host:$path",
+      "$dst",
+
+   );
+
+   #print "SCP: $exec ".join(" ",@params)."\n";
+   #dump @params;
+
+   my $command = "$exec " . join(" ",@params)."\n";
+   #print "'$command'\n";
+   
+#   $Expect::Log_Stdout=1;
+#   $Expect::Debug=3;
+#   $Expect::Exp_Internal=1;
+
+   # change time - workaround to verify success fetch 
+   my $ctime = 0; 
+   if (-e "$dst/$file") { $ctime = `stat  -c '%Z' $dst/$file`; }
+
+   if (! $identity && $pass) {
+      print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+
+      my $exp_scp = Expect->spawn($command)
+         or die "Cannot spawn $exec: $!\n";
+      my $epid =  $exp_scp->pid();
+
+      print eval $CL[1],"ASSH3 :: ",eval $CL[0] , "scp - fetching database ... ";
+
+      $exp_scp->log_stdout(0);
+
+      if( ! $exp_scp->expect(60, [ qr/[pP]assword:/ => sub {  
+            $exp_scp->send("$pass\n"); } ] ) 
+            ){
+         print "\rERROR :: Never got prompt on hostname: ".$exp_scp->exp_error()."\n";
+         print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+#       exit 1;
+      }
+   
+#     print $exp_scp->exp_error()."\n";
+      sleep(2);
+      $exp_scp->close();
+
+      my $ctime2; if (-e "$dst/$file") { $ctime2 = `stat  -c '%Z' $dst/$file`; }
+      if ($ctime2 - $ctime != 0 ){
+         print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "scp - database fetched!    \n";
+         print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+         return 1;
+      }else {
+         print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "scp - database not fetched \n";
+         print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+         return 0;
+      }
+      #print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "$file fetched successful!\n";
+
+   }
+   elsif ($identity || !$pass){
+      # no identity in arguments and no pass in arguments and no pass 
+      # in current databases, try to connect with scp if no  keys
+      # defined in user ~/.ssh/config you will be prompt for password 
+      @params = (
+        "-P$port",
+        "-p",
+        "$user\@$host:$path",
+        "$dst",
+      );
+      @params = (
+        "-P$port",
+        "$identity",
+        "-p",
+        "$user\@$host:$path",
+        "$dst",
+      ) if $identity ;
+      
+      $command = "$exec " . join(" ",@params)."\n";
+      # print "SCP: $command\n";
+      print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+      print eval $CL[1],"ASSH3 :: ",eval $CL[0] , "scp - fetching database ... ";
+
+      open (SCP, "$command |") or die "Failed to execute '$exec': $!\n";
+      #my @scp = <SCP>;
+      close SCP;
+
+      sleep (1);
+
+      my $ctime2; if (-e "$dst/$file") { $ctime2 = `stat  -c '%Z' $dst/$file`; }
+      if ($ctime2 - $ctime != 0 ){
+         print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "scp - database fetched!    \n";
+         print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+         return 1;
+      }else {
+         print eval $CL[1],"\rASSH3 :: ",eval $CL[0] , "scp - database not fetched \n";
+         print eval $CL[1],prl($LU,'-'),eval $CL[0],"\n" ;
+         return 0;
+      }
+
+
+   }
+
+
+
+}
+# ---------------------------------------------------------------------------- #
+# check_compression()
+# ---------------------------------------------------------------------------- #
+sub check_compression {
+
+   my $dst = shift;
+
+   my $exec = &find_cmd('file');
+   open (FT, "$exec --brief --mime-type $dst |")
+      or die "Failed to execute 'file' command: $!\n";
+   my $ft = <FT>;
+   close FT; 
+
+   if ($ft =~ /gzip/){
+      use IO::Uncompress::Gunzip qw(gunzip $GunzipError) ;
+      use File::Basename;
+      my $gzdst = basename ("$dst", ".gz") ;
+
+      # imported file should have an gz extension 
+      # if there is not gz then we cannot uncompress 
+      # file , file.txt (compressed)  to file.txt (uncompressed)
+      # please add gz extension to your commpressed database 
+      # or do not compress database
+      if (basename ($dst) eq basename($dst,".gz")) {
+         print <<EOF;
+: Imported file looks like gzip file but has not have an appropiate .gz        :
+: extension. Please add gz extension to your commpressed file or import        :
+: uncompressed database.                                                       :
+EOF
+         print ' '.prl ($LU-2,'-')."\n"; 
+         exit 1;
+      }
+
+      print "Uncompressing : ".basename($dst)." -> $gzdst \n";
+      print "S: $cfg{dbdir}/$gzdst\nD: $dst\n".$/ if $op{op_dbg};
+
+      # ------------------------------------------- #
+      if ( -e  "$cfg{dbdir}/$gzdst") {
+         print "File '$gzdst' exists, replace it ? [y/N]: ";
+         if (<STDIN> =~ /yes|Yes|[yY]/){
+            # backup old one first 
+            if (rename "$cfg{dbdir}/$gzdst", "$cfg{dbdir}/$gzdst.old"){
+               gunzip $dst => "$cfg{dbdir}/$gzdst" or 
+                die "ERR :: gunzip failed: $GunzipError\n";
+            }else {
+                print "ERR:: Couldn't backup '$cfg{dbdir}/$gzdst' \n";
+
+            }
+        }
+      }
+      else {
+         gunzip $dst => "$cfg{dbdir}/$gzdst" or 
+           die "ERR :: gunzip failed: $GunzipError\n";
+      }
+
+      # change permission 
+      my $mode  = (stat("$cfg{dbdir}/$gzdst"))[2] ;
+      my $owner = (stat("$cfg{dbdir}/$gzdst"))[4] ;
+      $mode=sprintf("0%o", $mode & 07777);
+      #print ":$mode:$owner:\n";
+      if ( ( $mode !~ /0[64]00/ || $owner ne $cfg{useruid} )   ){
+         print "Setting secure permissions (0600).\n";
+         chmod 0600 , "$cfg{dbdir}/$gzdst" ;
+      }
+
+      print "\nDatabase was imported successful.\n";
+      # remove .gz file
+      unlink $dst or die "Could not delate $dst\n";
+       # ------------------------------------------- #
+
+   }
+}
+
+# ---------------------------------------------------------------------------- #
+# importdb
+# ---------------------------------------------------------------------------- #
+
+sub importdb {
+
+   my $url    = shift ; 
+   my $prvkey = shift || undef ;
+   my $pubkey = shift || undef ;
+
+   # get filename from url;
+   my ($file) = $url =~ /\/([^\/]*?)(?:\?|$)/;
+   my $dst    = "$cfg{dbdir}/$file";
+
+
+   if ($url =~ /^(ftp[s]*|http[s]*|sftp|scp):\/\/(([^:]+)(:(.*))?\@)?(.*)/){
+
+      #print "$1 - $2 - $3 - $4 - $5 - $6 - $7\n";
+     
+      my $proto = $1;
+      my $user  = $3;
+      my $pass  = $5;
+      my $addr  = $6;
+
+
+      print prl($LU,'-').$/ if defined $op{op_dbg};
+      print "Proto   : $proto\n".
+            "User    : $user\n".
+            "Pass    : $pass\n".
+            "URL     : $addr\n".
+            "File    : $file\n".
+            "Output  : $dst\n" if defined $op{op_dbg};
+
+      if ( &backend_curl($proto)){
+
+         print "Backend : (curl) $proto supported\n\n" if defined $op{op_dbg};
+
+         if ( curl_get($addr,$proto,$user,$pass,$dst,$prvkey,$pubkey)){
+            &check_compression($dst);
+         }
+      
+      }
+      elsif ( $proto =~ /scp/ &&  &backend_ssh('scp')){
+         print "Backend : (scp) $proto supported\n\n" if defined $op{op_dbg};
+         if ($addr =~ /(([^:\/]+)(:([0-9]+))?)?(\/.*)/){
+            #print ">> $1 - $2 - $3 - $4 - $5 - $6 <<\n\n";
+
+            my $host = $2;
+            my $port = $4 || '22';
+            my $path = $5;
+         
+            if ( scp_get($path,$proto,$user,$pass,$dst,$host,$port,$file,$prvkey,$pubkey) ){
+                &check_compression($dst)
+            }
+
+         }
+      }
+      else {
+         #print "Backend : No available backends.\n"; 
+         #print prl($LU,'-')."\n";
+         print "ERR :: Sorry! $proto not supported, no available backends.\n"; 
+	 
+         exit 1;
+      }
+
+   }
+
+}
+
+# ---------------------------------------------------------------------------- #
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# main 
+# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------- #
+
+use Getopt::Complete (
+   # list the explicit values which are valid for this option
+   '<>'   => sub {
+
+          my %cfg =  &cfg_defval();
+          my $cfg_file = &find_cfg(\%cfg);
+          &cfg_parse($cfg_file ,\%cfg);
+          my ($command, $value, $option, $other_opts) = @_;  
+          if ( %{ $other_opts } ){
+              if ( ref($$other_opts{'<>'})  eq 'ARRAY' ){
+                 # cmd_alias autocompletition
+                 # tutaj 
+                 #my $x = \@{$$other_opts{'<>'}};
+                 #my $c = scalar keys @{$$other_opts{'<>'}};
+                 #return $c ;
+                 if ( scalar keys @{$$other_opts{'<>'}} > 1) {
+                    return [];
+                 }
+                 else {
+                    my $t = []; 
+                    foreach (sort keys %{$cfg{cmd_alias}}){
+                       push @$t, $_ unless (/CODE/);
+                    }
+                    push @$t,  keys %{$cfg{cmd_alias}{CODE}};
+                    return $t;
+                 }
+
+                 return [] ;
+              }
+              else {
+                 return [] ;
+              }
+          }
+          else {
+             #my %cfg =  &cfg_defval();
+             #my $cfg_file = &find_cfg(\%cfg);
+             #&cfg_parse($cfg_file ,\%cfg);
+             #  my @t = keys %cfg;
+             #  return \@t;
+             
+             return  &gpgpwdman(\%cfg,$cfg{passwdb},'getalihos','') ;
+#             my $short = ['-m', '-d', '-c', '-h', '-ls'];
+#             return  [ @{&gpgpwdman(\%cfg,$cfg{passwdb},'getalihos','')}, @{$short} ] ;
+         }
+    },
+    'parallel'   => undef,   # -p |  -pSSH mode  
+    'serial'     => undef,   # -s |  -sSSH mode  
+    'manager'    => undef,   # -m   
+    'exec'       => undef,   # -e  
+    'help!'      => undef,   # -h
+    'config'     => undef,   # -c  
+    'decode'     => undef,   # -dec - decode 
+    'version'    => undef,   # -v 
+    'set-title'  => undef,   # -t  - set title 
+    'debug'      => undef,   # -g  - debug
+    'x'          => undef,   # -x 1 -x 2   
+    'xls'        => undef,   # -xls | -xcmd 
+    # NOWE 
+    'database'    => 'f',   # -d | -db
+    'd'           => 'f',   # -d | -db
+    'exec-file'   => undef,   # -ef 
+    'nosu'        => undef,   # -1
+    'suuser'      => undef,   # -2
+    'nologout'    => undef,   # -no-logout, -tay
+    'via-proxy'   => undef,   # -via
+    'via-http'    => undef,
+    'via-socks'   => undef,
+    'list-proxy'  => undef,
+    'no-proxy'    => undef,   # no-via
+    'socks'       => undef,   # set connect with configured  proxy socks 
+    'no-fork'     => undef,
+    'list-socks'  => undef,
+    'knock'       => undef,   # -kssh -k 
+    'knock-only'  => undef,   #
+    'logsession'  => undef,   # log session input 
+    'import'      => undef,
+    'import-keys' => undef,   # -keys
+    'export'      => undef,
+    'settings'    => undef,
+    'aliases'     => undef,
+    'hosts'       => undef,
+    'pf-local'    => undef,
+    'pf-remote'   => undef,
+    'pf-dynamic'  => undef,   # -socks
+    'run-local'   => undef,
+    'group'       => undef,
+    'quiet'       => undef,
+
+    #l|login - wywalam , niebpotrzebna opcja 
+
+    # you can add any valid Getopt::Long specification to the key
+    # if you put nothing: "=s" is assumed
+
+);
+
+
+
+if ($#ARGV == -1 && keys %op == 0 ){ 
+   print "ASSH3 :: No arguments. Try usage -h or -help.\n"; 
+   exit (0); 
+}
+else {
+   ### check sockets dir          
+   if ( not -d $cfg{sockdir}){
+      system('mkdir','-p',"$cfg{sockdir}",'-m','0700') == 0 or
+        die "ERROR :: Couldn't create socket directory '$cfg{sockdir}'. $?\n";
+      print "ASSH3 :: Socket directory was created $cfg{sockdir} !\n";
+   } else { 
+      print "ASSH3 :: Socket directory exists at $cfg{sockdir} .\n" if defined $op{op_dbg}; 
+   }
+
+   if ( not -d $cfg{logdir}){
+      system('mkdir','-p',"$cfg{logdir}",'-m','0700') == 0 or
+        die "ERROR :: Couldn't create log directory '$cfg{logdir}'. $?\n";
+      print "ASSH3 :: Log directory was created at $cfg{logdir}! \n";
+   } else { 
+      print "ASSH3 :: Log directory exists at $cfg{logdir} .\n" if defined $op{op_dbg}; 
+   }
+
+ 
+   ### pwdfile ::  check default password file
+   if (defined $op{op_pwdb} ) {
+      # *** MULTI PASSWDDB SUPPORT ******************************************* #
+      #
+      # -d +db1.gpg,db2.gpg 
+      # -d db1.gpg,db2.gpg
+      # 
+      # ********************************************************************** #
+    
+      if (grep /^$op_args$/, @{$op{op_pwdb}} ){
+         die "Missing argument. Option -d requires an argument !\n";
+      }
+
+      @{$op{op_pwdb}} = split (/,/,join(',',@{$op{op_pwdb}}));
+
+      # if + sign is with arguments set use_cfg_db = 1 
+      my @dbs  = ();
+      my @duplicate  = ();
+      my $use_cfg_db = 0;
+
+      foreach my $pwdb ( @{$op{op_pwdb}}) {
+         if ($pwdb =~ /^[+]/) {    
+            $pwdb =~ s/^[+]// ; 
+            $use_cfg_db++;
+            #print "$pwdb\n"; 
+         }
+         if (-f $pwdb) {
+            if (! grep /$pwdb/, @dbs) {
+               push @dbs, $pwdb;
+            }
+         }
+         else {
+            print "ERROR:: Password database file not found in the specified path !\n";
+            print "ERROR:: No '$pwdb'\n";
+            exit 1;
+         }
+      }
+      #dump @dbs;
+      sub md5hf {
+         my $file = shift; 
+
+         use Digest::MD5 qw(md5_hex);
+         open FILE, "$file" or 
+           die "ERR:: Can not open $file: $!\n";
+         binmode FILE;
+         my $data = <FILE>;
+         close FILE;
+         return md5_hex($data);
+      }
+      # search duplicated database
+      if ($use_cfg_db) {
+         foreach my $argdb (@dbs){
+            #print "$argdb :\n";
+            # is the size is diffrent 
+            foreach my $cfgdb (@{$cfg{passwdb}}) {
+               #print "-s $cfgdb eq -s $argdb\n";
+               if ( -s "$cfgdb" eq -s "$argdb" ){
+                  # is the hash of file is diffrent 
+                  #print md5hf($cfgdb)." eq ".md5hf($argdb) ."\n";
+                  if ( md5hf($cfgdb) eq md5hf($argdb)){
+                      print "Found duplicated databases\n";
+                      print "Database $argdb is copy of $cfgdb\n";
+                      print " ".md5hf($cfgdb)." : $argdb\n ".md5hf($argdb)." : $cfgdb\n";
+
+                      push @duplicate,$argdb;
+                      exit 1;
+                  }
+               }
+            }
+         }
+
+         foreach my $db (@dbs) {
+            #print grep /$db/, @duplicate;
+            if ( ! grep /$db/, @duplicate){
+               push @{$cfg{passwdb}}, $db
+            }
+         }
+      }
+      else {
+         #dump @duplicate;
+         $cfg{passwdb} = \@dbs;
+      }
+      #print "\nUsing dbs : \n";
+      #dump @{$cfg{passwdb}};
+   }
+   elsif (ref($cfg{passwdb}) eq 'ARRAY'){
+      foreach (@{$cfg{passwdb}}){
+         if (-e $_) { 
+            #print "$_\n";
+         }
+         else {
+            print "ERROR :: Default password database(s) doesn't exist in the specified path!\n".
+                  "'$_' not found and no file was specified by the arguments.\n";
+            exit 1;
+         }
+      }
+   }
+   #print "type " . ref($cfg{passwdb}) ."\n";
+
+
+   #### TESTAREA ###
+   dump @ARGV  if defined $op{op_dbg};
+   dump @argv_cp  if defined $op{op_dbg};
+   dump \%op  if defined $op{op_dbg};
+   print "-------------------------\n" if defined $op{op_dbg};
+   #### TESTAREA ###
+
+   my $preg_alias = '^([a-z]|[A-Z]|[0-9])[0-9]*|^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\:\d{1,5})|^((([a-z]|[A-Z])+[0-9]*):\/\/([^\/]*))';
+
+   #dump @argv_cp;
+   #dump $op{op_pwdb};
+
+
+   if (defined $op{op_lsocks}){
+
+       my $rps_ref =  &psfind('-D\s+(\d+)');
+       if (scalar keys %{$rps_ref}) {
+           print "Lists of ssh running dynamic port forwarding (socks)\n";
+
+           foreach my $pid (sort keys %{$rps_ref}) {
+               chomp $$rps_ref{$pid};
+
+               if (defined $op{op_nowrap}) {
+                  printf "| %7s | %s \n", $pid, $$rps_ref{$pid};
+               }
+               else {
+                  printf "| %7s | %-62s .. |\n", $pid, substr $$rps_ref{$pid},0,62;
+               }
+            }
+        }
+        else {
+           print "No running ssh processes with dynamic port forwarding (socks).\n";
+        }
+        exit 0;
+   }
+   if (defined $op{op_lspf}){
+
+       my $rps_ref =  &psfind('-(L|R|D)\s+(\d+)');
+       #dump $rps_ref;
+       if (scalar keys %{$rps_ref}) {
+           print "Lists of ssh running port forwarding (socks)\n";
+
+           foreach my $pid (sort keys %{$rps_ref}) {
+               chomp $$rps_ref{$pid};
+               if (defined $op{op_nowrap}) {
+                  printf "| %7s | %s \n", $pid, $$rps_ref{$pid};
+               }
+               else {
+                  printf "| %7s | %-62s .. |\n", $pid, (substr $$rps_ref{$pid},0,62);
+               }  
+            }
+        }
+        else {
+           print "No running ssh processes with port forwarding.\n";
+        }
+        exit 0;
+   }
+ 
+   # knocker
+   if (defined $op{op_knocker} && defined $op{op_kssh}){
+      print "You can use only one of option: --knock or --knock-only.\n";
+      exit 0;
+   }
+   elsif (defined $op{op_knocker} && ! defined $op{op_kssh} && scalar @argv_cp eq 1  ){ 
+      knocker();
+   }
+ 
+   # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+   my $fqdn_re = '(?:(?:(?:(?:[a-zA-Z0-9][-a-zA-Z0-9]{0,61})?[a-zA-Z0-9])[.])*(?:[a-zA-Z][-a-zA-Z0-9]{0,61}[a-zA-Z0-9]|[a-zA-Z])[.]?)';
+   my $ipv4_re = '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})';
+   ########################################
+   # -via | -via-proxy http://localhost:8080, socks5://192.168.1.1:18050, 
+   #                   http://localhost , socks://192.168.1.1   
+   #                   # default ports for proxy type will be set when not specified
+   #
+   if (defined $op{op_vproxy}){
+      #print "'$op{op_vproxy}'\n";
+
+      # turn on using proxy for all 
+      $cfg{proxy} = 1;
+
+      if ($op{op_vproxy} =~ /^(http|socks[45]*):\/\/($fqdn_re|$ipv4_re)(:([0-9]+))*$/){
+         #print "$1 - $2 - $3 - $4 - $5\n";
+         $cfg{proxy} = 1;
+                           
+         $cli{proxy_type} = $1; 
+ 
+         if ($5){
+            $cli{proxy_host} = $2;
+            $cli{proxy_port} = $5;
+         }
+         else { 
+           $cli{proxy_host} = $2;
+         }  
+      }
+      elsif ($op{op_vproxy} ne '' ) {
+         print "Bad format - try proto://hostname[:port]\n";
+         exit 1
+   
+      }
+      #print "CLI via: \n"; dump %cli;
+      
+   }
+   #######################################
+   # -via-socks   socks4://localhost:10089 , socks://192.168.1.1:8050
+   #              localhost , 192.168.1.1:8050 
+   #              default proxy type is socks5 when not specified 
+   #              default port per proxy type will be used when not specified 
+   if (defined $op{op_vsocks}){
+       
+      $cfg{proxy} = 1;
+
+      # if url start with socks://
+      if ($op{op_vsocks} =~ /^(socks[45]*):\/\/($fqdn_re|$ipv4_re)(:([0-9]+))*$/) {
+         #print "$1 - $2 - $3 - $4 - $5\n";
+
+         $cli{proxy_type} = $1; 
+ 
+         if ($5){
+            #$ho = $1; $po = $2;
+            $cli{proxy_host} = $2;
+            $cli{proxy_port} = $5;
+         }
+         else { 
+           $cli{proxy_host} = $2;
+        }    
+      }
+      # if url start without proxy type (default socks5)
+      elsif ($op{op_vsocks} =~ /^($fqdn_re|$ipv4_re)(:([0-9]+))*$/) {
+         #print "$1 - $2 - $3 , $4 $5 $6 $7\n";
+         if ($4) {
+            $cli{proxy_host} = $1;
+            $cli{proxy_port} = $4;
+         }
+         else {
+            $cli{proxy_host} = $1;
+         }
+         $cli{proxy_type} = 'socks5'; 
+      }
+      elsif ($op{op_vsocks} =~ /^(http[s]*:\/\/)/){
+         print "Bad format, for http proxy url use options -via-http or -via.\n";
+         exit 1;
+      }
+      else {
+         print "Bad format - try [socks[45]://]hostname[:port] \n";
+         exit 1
+      }
+
+   }
+   ##################################
+   # -via-http <URL> 
+   # -via-http http://vps.bkzk.net:11090 , -via-http http://localhost:8089, 
+   # -via-http localhost , -via-http localhost:1090
+   #
+   if (defined $op{op_vhttp}){
+
+      $cfg{proxy} = 1;
+
+      # if url start with socks://
+      if ($op{op_vhttp} =~ /^(http[s]*):\/\/($fqdn_re|$ipv4_re)(:([0-9]+))*$/) {
+         #print "$1 - $2 - $3 - $4 - $5\n";
+         $cli{proxy_type} = $1; 
+         if ($5){
+            $cli{proxy_host} = $2;
+            $cli{proxy_port} = $5;
+         }
+         else { 
+           $cli{proxy_host} = $2;
+         }    
+      }
+      # if url start without proxy type (default socks5)
+      elsif ($op{op_vhttp} =~ /^($fqdn_re|$ipv4_re)(:([0-9]+))*$/) {
+         #print "$1 - $2 - $3 , $4 $5 $6 $7\n";
+         if ($4) {
+            $cli{proxy_host} = $1;
+            $cli{proxy_port} = $4;
+         }
+         else {
+            $cli{proxy_host} = $1;
+         }
+         $cli{proxy_type} = 'http'; 
+      }
+      elsif ($op{op_vhttp} =~ /^(socks[45]*:\/\/*)/){
+         print "Bad format, for proxy socks url use options -via-socks or -via.\n";
+         exit 1;
+      }
+      else {
+         print "Bad format - try [http[s]://]hostname[:port] .\n";
+         exit 1
+      }
+
+   }
+
+   # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+   if (defined $op{op_dbimp}){
+      if ($op{op_dbimp} =~ /^(ftp[s]*|http[s]*|sftp|scp):\/\/(.*)/){
+         #print "$1 - $2 - $3\n";
+         importdb($op{op_dbimp});
+      }
+      elsif ($op{op_dbimp} eq ''){
+
+         if (defined $op{op_dbimpkeys}) {
+            print "ERR :: Option -import without argument imports databases defined in your\n".
+                  "       configuration, if you use keys define them in your config file. \n";
+            exit 1;
+         }
+
+         if ( ! grep {/dbserver/}  keys %cfg) {
+            print "ERR :: You had not defined any database URL in your configuration file. \n";
+            print "Define one or specify URL as an option argument here.\n"; 
+            exit 1;         
+         }
+         print "Importing databases defined in configuration:\n";
+         foreach (sort keys %cfg){
+            if (/^(dbserver[0-9]*)$/){
+               print "$1 -> $cfg{$_}\n";
+               importdb($cfg{$_}, $cfg{"$1_prvkey"}, $cfg{"$1_pubkey"});
+            }
+         }
+      
+      }
+      elsif ($op{op_dbimp} ne '') {
+          print "Bad format - try [proto://[user[:password]@]hostname[:port]/path/to/database]\n";
+          exit 1;
+      }
+
+   }
+
+   # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+   sub alias_strip(){
+      my $sal  = shift ;
+      if ($sal =~ /(([a-z]|[A-Z])+[0-9]*):\/\/([^\/]*)/ ) {
+         print "URL found and stripped to $3\n" if !$op{op_quiet};
+         return $3 if defined $3;
+      }
+      # if not match as an url
+      # print "$sal";
+      return $sal;
+   }
+
+   # ASSH MODE ============================================================== #
+   #
+   # alias must contain only alphanumeric characters and start with a letter
+   # usage: assh <alias> [<cmd_alias>] [OPTIONS] 
+   #
+   # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+    if ( (defined "$argv_cp[0]" && "$argv_cp[0]" =~ /$preg_alias/)  ){
+
+       $0="assh $argv_cp[0]";
+       my ($alias,$rcmd,$mode) = ($argv_cp[0],undef,'single') ;
+
+       $alias = &alias_strip($alias);
+
+       if ( &optno( $op{op_exec},  $op{op_fexec},  $op{op_dec}, 
+              ((defined $argv_cp[1] &&  $argv_cp[1] !~ /^$op_args$|^-/)?1:undef) ) gt 1  
+          ) {
+          print "Try use only one of this option -e /-ef / -dec or cmd_alias . \n"; 
+          exit 1; 
+       }
+ 
+       ### get rcmd args ####
+       if (defined $op{op_exec} || defined $op{op_fexec}) {
+          if (defined $op{op_exec} && defined $op{op_fexec}){
+             print "Please specify just one of exec options (-e or -ef) not both.\n";
+             exit 1;
+          }
+          # exec command from cli
+          if (defined $op{op_exec}){ 
+             if ($op{op_exec} =~ /^$op_args$/ ) {
+                # ! at the end distinguish warning return from 
+                # Getopt::Long between this.
+                die "Option -e requires an argument !\n";
+             }
+             else { 
+                $rcmd = $op{op_exec};
+                #print "rcmd=$rcmd\n";
+                asshlogin($alias,$rcmd,0);
+                exit 0;
+             }
+          }
+          # exec command from file 
+          if (defined $op{op_fexec}){ 
+             if ($op{op_fexec}  =~ /^$op_args$/ ) {
+                die "Option -ef requires an argument !\n";
+             }
+             else { 
+                if (-f $op{op_fexec}){
+                   open EF , $op{op_fexec} or die $!;
+                   my @ef = <EF>;
+                   close EF;
+                   $rcmd = join ("",@ef);
+                   #print "rcmd=$rcmd\n";
+                   asshlogin($alias,$rcmd,0);
+                   exit 0;
+                }
+                else {
+                   print "No such file '$op{op_fexec}'.\n"; exit 1;
+                }
+             }
+          }
+       }
+
+       # **** CMD_ALIAS SUPPROT ********************************************** # 
+       elsif (defined $argv_cp[1] && ($argv_cp[1] !~ /^$op_args$|^-/ ) ) {
+          #my $cmd_alias = $argv_cp[1]; 
+          my %cal = (); 
+          # argv collection
+          $cal{$argv_cp[1]} = ["$alias"];   #$alias will be CMDARG[0] if defined for CMD_ALIAS
+          for (my $i=2 ; $i <= $#argv_cp ; $i++){
+              if ($argv_cp[$i] !~ /^$op_args$/ && $argv_cp[$i] !~ /^-/) {
+                 #print "$argv_cp[$i] \n";
+                 push @{$cal{$argv_cp[1]}}, $argv_cp[$i]; 
+              } 
+              else { last; } # jesli napotkasz w kolejnosci petli argument z dashem - 
+                             # przerwij zbieranie argsow 
+          }
+          #dump %cal;
+          #&cfg_cal_parse(\%cfg,$argv_cp[1]); #cmd_alias z konfiga z czytana 
+
+          my $ca =  &cfg_cal_parse(\%cfg,\%cal,$mode); #cmd_alias z konfiga z czytana 
+          asshlogin($alias,$ca,1);
+
+       }
+       # ********************************************************************* #
+       else {
+          asshlogin($alias,'',1);  
+       }
+
+    }
+
+    # PSSH MODE ============================================================== #
+    #
+    # usage: assh -p|-pssh|-pSSH <REEGEX> <CMD> [option: -f <FILENAME> , ] 
+    elsif ( defined  $op{op_pssh}   ) {
+
+       my ($aliases, $rcmd,$mode) = ($op{op_pssh},undef,undef);
+       if ($argv_cp[0] =~ /^[-]*s/) { $mode = 'serial';} else { $mode = 'parallel'; }
+       $0="assh [$mode mode]";
+
+
+       if ( &optno( $op{op_exec},  $op{op_fexec},  $op{op_dec}, 
+              ((defined $argv_cp[2] && $argv_cp[2] !~ /^$op_args$|^-/)?1:undef) ) gt 1  
+          ) {
+          print "Try use only one of this option -e /-ef / -dec or cmd_alias . \n"; 
+          exit 1; 
+       }
+       # execute remote command --exec|-e <REOMTE_COMMANDS>
+       if (defined $op{op_exec} || defined $op{op_fexec}) {
+          if (defined $op{op_exec} && defined $op{op_fexec}){
+             print "Please specify just one of exec options (-e or -ef) not both.\n";
+             exit 1;
+          }
+          # exec command from cli
+          if (defined $op{op_exec}){ 
+             if ($op{op_exec} =~ /^$op_args$/ ) {
+                die "Option -e requires an argument !\n";
+             }
+             else { 
+                $rcmd = $op{op_exec};
+                pSSH($aliases,$rcmd,$mode);
+                exit 0;
+             }
+          }
+          # exec command from file 
+          if (defined $op{op_fexec}){ 
+             if ($op{op_fexec} =~ /^$op_args$/ ) {
+                die "Option -ef requires an argument !\n";
+             }
+             else { 
+                if (-f $op{op_fexec}){
+                   open EF , $op{op_fexec} or die $!;
+                   my @ef = <EF>;
+                   close EF;
+                   $rcmd = join ("",@ef);
+                   #print "rcmd=$rcmd\n";
+                   pSSH($aliases,$rcmd,$mode);
+                   exit 0;
+                }
+                else {
+                   print "No such file '$op{op_fexec}'.\n"; exit 1;
+                }
+             }
+          }
+       }
+       # **** CMD_ALIAS SUPPROT ********************************************** #
+       # 
+       # assh -s 'vps|s[12][0-9]$' CMD_ALIAS CMDARG[1] CMDARG[2]
+       #
+       # ********************************************************************* #
+       elsif (defined $argv_cp[2] && ($argv_cp[2] !~ /^$op_args$|^-/ ) ) {
+          #my $cmd_alias = $argv_cp[1]; 
+          #dump @argv_cp;
+
+          my %cal = (); 
+          # cmd_alias argv collection
+          $cal{$argv_cp[2]} = ['NOCMDARG[0]'];
+          for (my $i=3 ; $i <= $#argv_cp ; $i++){
+              if ($argv_cp[$i] !~ /^$op_args$/ && $argv_cp[$i] !~ /^-/) {
+                 #print "$argv_cp[$i] \n";
+                 push @{$cal{$argv_cp[2]}}, $argv_cp[$i]; 
+              } 
+              else { last; } # jesli napotkasz w kolejnosci petli argument z dashem - 
+                             # przerwij zbieranie argsow 
+          }
+          #dump %op;
+          #&cfg_cal_parse(\%cfg,$argv_cp[1]); #cmd_alias z konfiga z czytana 
+          my $ca =  &cfg_cal_parse(\%cfg,\%cal,$mode); #cmd_alias z konfiga z czytana 
+
+          #print "Solving COMMAND ALIAS :\n$ca\n";
+
+          pSSH($aliases,$rcmd,$mode);
+
+       }
+       ####################
+       elsif (not defined $op{op_dec}) { 
+          print "Missing command arguments. ".
+                "Try with option -e <REMOTE_COMMAND> or -dec or use help. \n"; 
+                exit 1; 
+       }
+       pSSH($aliases,$rcmd,$mode);
+
+
+    }    
+    # GROUPS MODE =========================================================== #
+    #
+    # self assh -g groupname,groupname,... lists members of groups 
+    # split groups by colon and search members 
+    elsif (defined $op{op_groups}){
+
+       my @arg_gr = (split /,/,$op{op_groups}); 
+
+       sub get_group_member(){
+           my $gr = shift;
+           my $member =  &gpgpwdman(\%cfg,$cfg{passwdb},'groups','');
+           return \@{$$member{$gr} } if defined $$member{$gr} 
+       }
+
+       sub get_group_name(){
+           my $member =  &gpgpwdman(\%cfg,$cfg{passwdb},'groups','');
+           return (sort keys %{$member}); 
+       }
+
+       if ($op{op_groups} eq '') {
+
+          my @gr =  (&get_group_name);
+          if (@gr) {
+             my $s = 0;
+             if (!$op{op_quiet}){
+                 print "Found groups: ";
+                 $s = length "Found groups: ";
+             }
+             my $line = 80;
+             foreach my $g (@gr){
+             #foreach my $g (&get_group_name){ 
+                my $mlen = length $g; 
+                if ($line%($s+$mlen+1) < $line) {
+                   printf "%s ",$g ; 
+                   $s += $mlen + 1;
+                }
+                else { 
+                   printf "\n%s ",$g ; 
+                   $s = $mlen + 1;
+                }
+             }
+             print $/;
+          }
+          else {
+             print "No groups found.\n"
+          }
+       }
+       else {
+          foreach my $gr (split /,/,$op{op_groups}){
+             my $mem_ref =  &get_group_member($gr);
+
+             if (!$mem_ref) {
+                print "Group not found.\n"; exit 0;
+             }
+
+             print "Members of group: [$gr]\n" if (!$op{op_quiet});
+             if (defined $op{op_nowrap}) {
+                print "$gr: @{$mem_ref}\n";
+             }
+             else {
+                my $s = 0; 
+                my $line = 80;
+                foreach my $m (@{$mem_ref}){
+                   my $mlen = length $m; 
+                   if ($line%($s+$mlen+1) < $line) {
+                      printf "%s ",$m ; 
+                      $s += $mlen + 1;
+                   }
+                   else { 
+                      printf "\n%s ",$m ; 
+                      $s = $mlen + 1;
+                   }
+                }
+                print $/;
+             }  
+          }
+       }
+
+    }
+    # execute remote commands and disconnecting session
+    elsif ( defined  $op{op_exec}   ) { 
+       print "Try usage with <ALIAS> -e <REMOTE_COMMAND>\n"; 
+       exit 1;
+    }
+    # *** PASSWORD MANAGER *************************************************** #
+    elsif (defined $op{op_pm}) {
+
+       # przy edycji bazy w pm, domyslnie jest brana pierwsza baza z listy z defioniowanych 
+
+       if (! -e $cfg{exec_pm}){
+          print "ERR :: Could not find ASSH Password Manager (asshpm) binary in known path.\n";
+
+       }
+
+       my $pm_args = '';
+       if (defined $op{op_pwdb}){
+#          if (grep /^$op_args$/, @{$op{op_pwdb}} ){
+#             # print grep /^$op_args$/, @{$op{op_pwdb}} ;
+#             die "Missing argument. Option -d requires an argument !\n";
+#          }
+          if (-e @{$op{op_pwdb}}[0]) {
+             $pm_args = "-d ". @{$op{op_pwdb}}[0] ;
+          }
+          else {
+            print "ERROR :: Default password database doesn't exist in the specified path!\n".
+                  "'$_' not found and none file was specified by the arguments.\n";
+            exit 1;
+          }
+       }
+       else {
+          $pm_args = "-d ". @{$cfg{passwdb}}[0] ;
+       }
+
+       $pm_args   .= " -c $op{op_fcfg}" if defined $op{op_fcfg};
+
+       if (-e $cfg{exec_pm}){
+          print "Running asshpm ..\n";
+          system( "$cfg{exec_pm} $pm_args" );
+       }
+    }
+    # use external passwd file
+    elsif ( defined  $op{op_pwdb}   ) { 
+       print "Try usage with <ALIAS> -d <PASSWDB_FILE>\n"; 
+       exit 1;
+    }
+    # decode
+    elsif ( defined  $op{op_dec}   ) { 
+       print "Try usage with <ALIAS> -dec \n"; 
+       exit 1;
+    }
+    elsif ( defined  $op{op_socks}   ) { 
+       print "Try usage with <ALIAS> -socks [<port>]  \n"; 
+       exit 1;
+    }      
+    elsif (defined $op{op_help}) {
+
+       print <<EOF;
+Usage: assh host [OPTIONS]
+
+       SINGLE MODE
+
+        assh host [[cmd_alias cmdargs]|[-e cmd]|[-ef cmd_file]|[-dec]] [OPTIONS]
+
+       PARALLEL MODE
+
+        assh [-p|-s] host_pattern [[cmd_alias cmdargs]|[-e cmd]|[-ef cmd_file]|
+                                  [-dec [-aliases|-hosts] ] [OPTIONS]
+
+       DATABASE MANAGER
+
+        assh -m [-d passwd_file] [-c config_file]
+
+       OPTIONS:
+        [-1|-2][-via [proto://host[:port]]][-via-socks [socks[45]://]host[:port]]
+        [-via-http [http[s]://]host[:port]][-no-proxy][-k [port1,..,portN]]
+        [-L [bind_addres:]lport:[host]:hport][-R [bind_address:]lport:[host]:hport]
+        [-D [[bind_address:]port]][-no-fork][-list-pf][-list-socks][-list-proxy]
+        [-m][-d [+]passwd_file][-run-local] [-c config_file] [-man] [-h] [-fpr]
+        [-import [URL] [-import-keys [private_key:]public_key]][-aliases|-hosts]
+        [-settings] [-g [groupnames]]
+EOF
+
+
+
+
+    }
+    elsif (defined $op{op_vers}) {
+       print "ASSH version:  $version  written by: $author\n"; exit 0;
+    }
+    # show settings
+    # ----------------------------------------------------------------------- #
+    elsif (defined $op{op_cfgset}){
+       print "ASSH version:  $version  written by: $author\n";
+       print "\n";
+       print "Current configuration:\n";
+       foreach (@{$cfg{passwdb}}){
+          print " passwd db in use    : (";
+            (-e $_)?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+            print eval $CL[0],") $_\n";
+       }
+       print " socket dir          : (";
+         (-e $cfg{sockdir})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{sockdir}\n";
+       print " passwd db dir       : (";
+         (-e $cfg{dbdir})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{dbdir}\n"; 
+       print " logs dir            : (";
+         (-e $cfg{logdir})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{logdir}\n"; 
+ 
+       print " config file         : (";
+         (-e $cfg_file)?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg_file\n";
+       print " default passphrase  : $cfg{passphrase}\n".
+             " default agent ttl   : $cfg{agentttl}\n".
+             " default pinentry ui : $cfg{pinui}\n".
+             " execution sleeptime : $sleeptime sec\n";
+       print " exec path asshpm    : (";
+         (-e $cfg{exec_pm})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_pm}\n";
+       print " exec path gpg2      : (";
+         (-e $cfg{exec_gpg2})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_gpg2}\n";
+       print " exec path gpg-agent : (";
+         (-e $cfg{exec_gpgagent})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_gpgagent}\n";
+       print " exec path pinentry  : (";
+         (-e $cfg{exec_pinentry})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_pinentry}\n";
+
+       print " exec path netcat    : (";
+         (-e $cfg{exec_nc})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_nc}\n";
+        
+       print " exec path curl      : (";
+         (-e $cfg{exec_curl})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{exec_curl}\n";
+
+
+       print " suenv               : (";
+         ($cfg{suenv} eq 'on')?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{suenv}\n";
+
+       print " colors              : (";
+         ($cfg{color} eq 'on')?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{color}\n";
+
+       print " tooltips            : (";
+         ($cfg{tooltips} eq 'on')?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{tooltips}\n";
+
+       print " proxy               : (";
+         ($cfg{proxy})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{proxy}\n";
+ 
+       print " proxy_url           : (";
+         ($cfg{proxy_url})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{proxy_url}\n";
+ 
+       print " prox_default        : (";
+         ($cfg{proxy_default})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{proxy_default}\n";
+ 
+       print " prox_filter         : (";
+         ($cfg{proxy_filter})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{proxy_filter}\n";
+
+       print " knock_seq           : (";
+         ($cfg{knock_seq})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") @{$cfg{knock_seq}}\n";
+         
+       print "-- ASSH Password Manager --\n";
+
+       print " public key in use   : (";
+         ($cfg{pubkey} eq 'on')?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{pubkey}\n";
+       
+       print " rcpt pubkey id      : (";
+         ($cfg{recipient})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{recipient}\n";
+       print " rcpts pubkey id     : (";
+         ($cfg{recipients})?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{recipients}\n";
+
+       print " gnupg cipher        : (";
+         ($cfg{cipher_algo} )?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{cipher_algo}\n";
+
+       print " gnupg commpression  : (";
+         ($cfg{compress_algo} )?(print eval $CL[2],"+"):(print eval $CL[3],"-");
+         print eval $CL[0],") $cfg{compress_algo}\n";
+
+       print prl($LU,'-').$/;
+
+    }
+}
+
+=pod
+
+=head1 ASSH
+
+B<assh> - Automated (autologin) SSH client
+
+=head1 SYNOPSIS
+
+B<assh> B<I<host>> [OPTIONS]
+
+B<SINGLE MODE>
+
+B< >B<assh> B<I<host>> [[B<I<cmd_alias> I<cmdargs>>]|[B<-e> I<cmd>]|[B<-ef> F<cmd_file>]|[B<-dec>]] [OPTIONS]
+
+B<PARALLEL MODE>
+
+B< >B<assh> [B<< -p >>|B<-s>] B<I<host_pattern>> [[B<I<cmd_alias> I<cmdargs>>]|[B<-e> I<cmd>]|[B<-ef> F<cmd_file>]|
+                           [B<-dec> [B<-aliases>|B<-hosts>] ] [OPTIONS]
+
+B<DATABASE MANAGER>
+
+B< >B<assh> B<-m> [B<-d> F<passwd_file>] [B<-c> F<config_file>]
+
+B<OPTIONS:>
+
+B< >[B<-1>|B<-2>][B<-via> [I<proto://host[:port]>]][B<-via-socks> I<[socks[45]://]host[:port]>]
+ [B<-via-http> I<[http[s]://]host[:port]>][B<-no-proxy>][B<-k> [I<port1,..,portN>]]
+ [B<-L> I<[bind_addres:]lport>:[I<host>]:I<hport>][B<-R> I<[bind_address:]lport>:[I<host>]:I<hport>]
+ [B<-D> [I<[bind_address:]port>]][B<-no-fork>][B<-list-pf>][B<-list-socks>][B<-list-proxy>]
+ [B<-m>][B<-d> F<[+]passwd_file>][B<-run-local>] [B<-c> I<config_file>] [B<-man>] [B<-h>] [B<-fpr>]
+ [B<-import> [I<URL>] [B<-import-keys> F<[private_key:]public_key>]][B<-aliases>|B<-hosts>]
+ [B<-settings>] [B<-g> [I<groupnames>]]
+
+
+
+
+=head1 DESCRIPTION
+
+ ASSH was written to automate the process  of logging on  to servers that
+ do not allow  direct root login. ASSH uses gpg-agent to store passphrase  
+ for database password file.  Thanks  to this  there  is no need to enter 
+ this passphrase every time  you want to connect remotely to the  server. 
+ Once  you  enter the passphrase it is kept by gpg-agent  in memory for a 
+ certain period of time. This tool allow you to remotely execute  command 
+ also in  parallel mode (pseudo parallel - serial mode for now). It has a 
+ lof of new features, just read the manual for details.
+
+
+=over 2
+
+=item B<host> 
+
+ host can be an alias, ip address or hostname  which match to  database
+ alias, IP field or IPv4/v6 networks  assigned to record.  When host do
+ not match to  one of the  database  field then if it is possible it is 
+ resolved to an ip or hostname and then the database is searched again.
+
+ Assh uses the password database(s) encrypted  with GnuPG. This databa-
+ ses stores records to servers to which you want to automate  log into.
+ Each  record has  got assigned  an alias  which  should  be  unique in
+ database and clearly identifying the server. 
+ 
+=item B<host_pattern>
+
+ host_pattern defines scope of the hosts that are by default matched by
+ an alias or ip field on  database.  This is only used  in  parallel or
+ serial mode.  For each pattern that the record  matches, assh executes
+ the associated action. Just try some regular expression.
+
+ Examples:
+ 
+  Match servers with aliases serv10 to serv20 and vps1 vps4 vps6 
+
+   $ assh -s '^serv[12][0-9]|vps[146]$' ....
+
+ See below for more examples. 
+
+=item B<cmd_alias> [cmdarg1 cmdarg2 .. cmdargN]
+
+ cmd_alias  is define in configuration  file alias for  most frequently
+ used commands. This command aliases can get additional arguments. This
+ arguments are optional and when defined with cmd_alias  must or not be
+ used together with cmd_alias, it depends on the type of cmd_alias.
+ After processing cmd_alias command is executed right after you log in-
+ to the server. 
+
+ There  are  three ways  you can  can define cmd_alias in configuration 
+ file. These commands can be  defined  with  CMD{},  FILE{}  or  CODE{} 
+ blocks. It gives you flexibility  to create your  own set of  creative
+ aliases.  Read  about configuration file about howto exactly set them. 
+
+ Examples: 
+
+  Log in and use exigrep to find all logs corresponding to specified 
+  email from  last-hour or last-day. 
+
+   $ assh serv10 eg tom@example.net last-hour
+          ^      ^            ^         ^
+   host_alias   cmd_alias   cmdarg1  cmdarg2
+
+  Log in and kill specific process.
+
+   $ assh serv30 kill php-cgi httpd
+
+  Log in and enter into OpenVZ container with specified VZID
+
+   $ assh vps4 ve 110
+ 
+=item B<-e> | B<-exec> I<command(s)>
+
+ Execute remote command(s)  and logout. If  you  do not  want to  leave 
+ session after executing command(s) run it with additional  --no-logout
+ option.  Commands are specify as an option  argument. When  command is
+ not a single word remember use it with  quotation marks.
+
+ Examples:
+
+   $ assh serv10 -e /root/myscript.sh
+
+   $ assh example.net -e 'uptime; free -m; cd ~ && sh myscript.sh'
+
+   $ assh -s '^serv[12][0-9]$' -e 'apt-get update;apt-get install snmp'
+
+ Notice! 
+
+ You can use only one of this option at once: "cmd_alias", option "-e",
+ option "-ef" or option "-dec" 
+ 
+
+=item B<-ef> | B<-exec-file> F<commands_file>
+
+ Execute remote command(s)  and logout. If  you do  not  want to  leave
+ session after executing command(s) run it with additional  --no-logout
+ option. Commands  are specified  in file and then execute line by line
+ after login on server(s). This file is not transfer to the server.
+
+ Examples: 
+
+  Define set of commands in some file, for example:
+
+   $ cat >commands.txt <<EOF
+   [[ -f /etc/debian_version ]] &&
+     apt-get -y install snmp snmpd;
+   [[ -f /etc/centos_version ]] &&
+     yum install net-snmp net-snmp-utils;
+   EOF
+
+  and then just: 
+ 
+   $ assh serv10.example.net -ef commands.txt
+
+   $ assh -s '^serv[12][0-9]$' -ef commands.txt
+ 
+ Notice! 
+
+ You can use only one of this option at once: "cmd_alias", option "-e",
+ option "-ef" or option "-dec" 
+
+=item B<-dec> | B<-decode>
+
+ Prints details about matching host(s) from passwword database record.
+
+ Examples: 
+
+   $ assh serv10.example.net -dec
+   $ assh 192.1.2.1 -dec 
+
+ Make dump of whole database(s):  assh -s '' -dec [-d [+]<db_list>]
+
+   $ assh -s '' -dec -aliases
+   $ assh -s '' -dec -d db1.gpg,db2,gpg -aliases
+
+ Notice!
+
+ Using option "-aliases"  or  "-hosts"  with option "-dec"  limits dump 
+ results to be searched only by aliases or hosts. By defaults hosts are 
+ matched on alias  and host fields in databases what causes duplication
+ of entries.
+
+=item B<-run-local>
+
+ Excecute command alias locally  without login into the server.  It can 
+ be usuful when testing new command aliases. 
+
+=item B<-1> | B<-nosu> 
+
+ This option log you into the server with the first defined user 
+ account.  See below about password database format. 
+
+=item B<-2> | B<-suuser>
+
+ This option  forces to log in to second  user account directly without 
+ the intermediary  account. In most  cases this will be your  root user
+ account and if it is not disable on remote SSH server you can log into
+ it directly.
+
+
+=item B<-s> | B<-serial> | B<-sssh> I<host_pattern>
+
+ Serial mode allows you to execute remote command(s) on group of hosts.
+ Commands are executes host by host. It is in some way more secure than
+ parallel mode which executes commands on hosts with threads  what is a
+ much faster method  than a serial  but when you make a mistake in your
+ set of  commands  there is a good chance  that with parallel  mode you 
+ fail to interrupt this process before it finish.
+
+ This mode is most useful when  used  with one of options:  "-e", "-ef"
+ "cmd_alias" or "-dec". With "-dec" option it allow you to dump records
+ from password database(s) for specified scope of hosts.
+
+ Examples: 
+
+  Block class of attacking IPs with iptables on group of servers: 
+
+   $ assh -s '^s[1-9][0-9]$|pro|seo' -e \
+        'iptables -A INPUT -s  192.0.2.0/24 -j DROP'
+
+  Execute commands from commands.txt on group of servers 192.0.2.0/28
+
+   $ assh -s '192.0.2.[0-15]' -ef commands.txt
+
+  Display all records from specific database:
+
+   $ assh -s '' -dec -d /path/to/db1.gpg -aliases
+   
+
+ Option: "-hosts" or "-aliases" restrics search pattern to only aliases
+ or hosts field in database records. It will solve problems with dupli-
+ cating. Use only one of them. Using both is identical as not using any
+ of them.
+
+=item B<-p> | B<-parallel> | B<-pssh> I<host_pattern>
+
+ Option currently disable. 
+
+=item B<-c> | B<-config> F<config_file>
+
+ Specify alternate configuration file. Useful to test new option.
+
+=item B<-d> | B<-database> F<[+]db1.gpg,db2.gpg,..>
+
+ You can specify multiple databases in  configuration file, but if  you
+ temporarly want to search record in other database(s)  you can specify
+ them as an argument of this option. 
+ Multiple databases can be specified as an argument seperated  by colon
+ (,) but without whitespaces before them or you can  specify  multiple 
+ "-d" option with argument as example: 
+
+   -d db1.gpg,db2.gpg
+   -d db1.gpg -d db2.gpg 
+  
+   -d +db1.gpg,db2.gpg 
+   -d +db1.gpg -d db2.gpg 
+
+ There is a special function with (+) plus sign. When plus sign is used 
+ before database  name (before first database when multiple are specify
+ with colons) all databases from arguments are used together  with this
+ dataases  from configuration,  without  this  plus sign  you overwrite
+ using databases from configuration file. 
+
+ Try to not duplicate databases, there is a simple test which verify if
+ database is already use or not . 
+
+=item B<-x> 
+ 
+ This option is deprecated.
+
+=item B<-xls>
+
+ This option is deprecated.
+
+=item B<-k> | B<-knock> | B<-kssh> [I<port1,port2,port3>]
+
+ Port knocking allows your firewall to keep your port closed  until you 
+ ask for a port to be opened through  a  specific  sequence of  network
+ traffic. Port knocking must be configure on server by a clean firewall
+ rules or by additional services like knockd deamon. 
+
+ You can define  as  option argument or with server  record in database
+ ports list in order which should be knocked before ssh connection. 
+
+ Example: 
+
+  $ assh sserv10 -k 7777,8877,7788
+
+
+=item B<-L> | B<-pf-local> [I<[bind_address:]port:[host]:port>]
+
+ Local port forwarding lets you establish  connection  with destination 
+ server port via local port. Connections from local port  are forwarded
+ via the remote SSH server to destination server port.
+
+ SSH client syntax:
+
+  -L  [bind_address:]port:host:hostport hostname
+
+ Examples: 
+
+ Connections are forwarded from your local port 13306 to localhost:3306
+ on your server. By default when you not set destination server it will 
+ be the localhost of SSH server. 
+
+  $ assh serv10 -L 13306::3306 
+
+ is equivalent to: 127.0.0.1:13306:127.0.0.1:3306
+  
+
+ Connection are forwarded from  your local port 18080 to example.net:80
+ via your SSH server serv20.
+
+  $ assh serv20 -L 18080:example.net:80 
+
+ EXPERIMENTAL: ASSH Port forwarding is based on Expect method  and this
+ is not reliable and sometimes or on some system could not work all the
+ time. You can also try with '--no-fork' option which should setup your
+ tunnel properly but without forking into backgroud.
+
+
+=item B<-R> | B<-pf-remote> [I<[bind_address:]port:[host]:port>]
+
+ Remote port forwarding lets you establish connection  with your local-
+ host port via SSH server port. SSH will make a connection between your
+ local port and the newly opened port  on the server  side. Now you can
+ connect to your newly opened port  on SSH server from anywhere and get
+ access to  your local machine. Remember that SSH server  need to allow
+ you for this and by default most don't. 
+
+ "Specifying a remote bind_address will only succeed if the server's 
+  GatewayPorts option is enabled (see sshd_config(5)). "
+
+ SSH client syntax:
+
+  -R  [bind_address:]port:host:hostport hostname
+
+ Examples:
+
+ Forward connection to 192.0.2.1 port 10022 to my localhost SSH server:
+
+  $ assh serv10 -R 192.0.2.1:10022::22
+
+ is equivalent to: 192.0.2.1:10022:127.0.0.1:22
+
+ EXPERIMENTAL: ASSH Port forwarding is based on Expect method  and this
+ is not reliable and sometimes or on some system could not work all the
+ time. You can also try with '--no-fork' option which should setup your
+ tunnel properly but without forking into backgroud.
+
+
+
+=item B<-D> | B<-pf-dynamic> | B<-socks> [I<[bind_address:]port>]
+
+ Dynamic port forwarding  lets  you  forward connection from your local 
+ port via SSH server to any destination port. 
+
+ Dynamic port forwardings can  also  be specified in the password data-
+ base record. If no option  argument was specified  then if host record  
+ contain specific port  number in appropriate field then this port will
+ be set  otherwise the default port  is  use. As a normal  user you are
+ only allowed  to  forward  ports  above 1024.  Only root  can  forward 
+ privileged ports. Assh by default bind  on  local interface  127.0.0.1
+ and port 1080. Read section about extra args in password database.
+
+ SSH client syntax: 
+
+  -D [bind_address:]port  hostname
+
+ Example: 
+
+   $ assh vps -D 10080
+
+ ssh(1) manual about 'dynamic' port forwarding:
+
+ "This works by allocating a socket to listen to port on the local side 
+ optionally bound to the specified bind_address.  Whenever a connection 
+ is  made  to  this  port, the connection is forwarded  over the secure  
+ channel,  and the application protocol is then used to determine where  
+ to connect to from the remote machine. Currently the SOCKS4 and SOCKS5
+ protocols are supported, and ssh will act as a SOCKS server."
+
+ EXPERIMENTAL: ASSH Port forwarding is based on Expect method  and this
+ is not reliable and sometimes or on some system could not work all the
+ time. You can also try with '--no-fork' option which should setup your
+ tunnel properly but without forking into backgroud.
+
+=item B<-no-fork> 
+
+ Used with port forwarding option solves some issue with setting tunnel 
+ and  forking into  background.  This  will keep your tunnel connection 
+ until  you close your console session, usuelly with Ctrl+C .
+
+=item B<-list-pf>
+
+ Print running ssh processes with any port forwarding option. 
+
+=for 
+=item B<-list-pf-local>
+=for 
+ Print running ssh processes with local port forwarding option. 
+ This option is currently not supported. 
+
+=for
+=item B<-list-pf-remote>
+=for
+ Print running ssh processes with remote port forwarding option. 
+ This option is currently not supported. 
+
+=item B<-list-socks> 
+
+=for | B<-list-pf-dynamic>
+
+ Print running ssh processes with dynamic port forwarding option. 
+
+=item B<-list-proxy>
+
+ Lists available proxy server options for specified host. It will check
+ globally  defined  proxy from config, hosts  specific proxy defined in
+ record  from  password  database and CLI arguments. It shows which one
+ of them will be used for future  connections.
+
+=item B<-via-proxy> | B<-via> [I<proto://host[:port]>]
+
+ Set connection with host via proxy. Proxy address can be  specify in 3
+ diffrent places.  As a CLI option, as an option in  record in password
+ database or globally in configuration file. 
+
+ If for specific host proxy server is defined  in  all  places, then by 
+ default it connect via proxy defined by a command line argument,  next  
+ if CLI argument is not specified then record  option is used  if exist
+ and  the  last  if  no proxy  in CLI or record  database is found, the
+ globally specify server from configuration file is use. You can change
+ this hierarchy to always use for example proxy server from config file
+ and not from  record  databases or CLI  even  if  exits  by specifying
+ in config option: proxy_default=config. 
+ Read about configuration file for details. 
+
+
+ URL Format: 
+
+   proto://hostname[:port]
+
+ Proxy socks
+
+   socks://localhost:1080
+  
+  When socks version is not specifed, version 5 is default value, socks
+  and socks5 are eqivalent.
+
+   socks4://localhost:1080
+   socks5://localhost:1080
+
+ HTTP proxy 
+
+   http://hostname:3128 
+
+ Examples:
+
+   $ assh vps -via socks://127.0.0.1:10090
+
+   $ assh s1.example.net -via http://gw.example.net:3218
+
+
+=item B<-via-socks> I<[proto://]host[:port]>
+ 
+ Option similar to the above except that it requires an  argument.  URL 
+ may have skipped protocol, by default SOCKS5 is used. Allowed protocol
+ option are socks://, socks4:// and socks5://.  Default  port for socks
+ proxy is 1080.
+
+=item B<-via-http> I<[proto://]host[:port]>
+
+ Option similar to the above except that it requires an  argument.  URL
+ may have  skipped protocol, by default  HTTP is used. Allowed protocol
+ option are http:// and https://. Default port for http proxy is 3128.
+
+ Notice! Currently only http proxy without authentication is supported.
+
+=item B<-no-proxy> | B<-no-via>
+
+ Disable  using  proxy  for  specific  connection when proxy is turn on 
+ globally in configuration file.
+
+=item B<-import> I<[proto://[user[:password]@]hostname[:port]/path/to/db]>
+
+ Supported protocols : ftp, ftps, http, https, scp 
+ Backends for        : curl, scp 
+
+ This protocols are supported via CURL, unfortunettly  ssh  protocols -
+ scp, sftp  are  not  supported  currently in curl binary by default in
+ most distribution. Because  of  that scp support was included with scp
+ backend. To get ssh protocols supported  with curl, you  can recompile
+ your distribution source of curl  binary  with  extra  flag 
+ '--with-libssh2'. First you  need to install  libssh2 library which is
+ available in all modern distribution.
+
+ If  URL is not specify then is searched in your configuration  file
+ ~/.assh/assh.conf  where you can specify multiple urls whith keyword: 
+ 'dbserverN' where N is key number.
+
+
+ URL Format: 
+
+ proto://[user[:password]@]hostname[:port]/path/to/database.gz
+
+
+ FTP(S) Server 
+
+  :: FTP without SSL
+  ftp://login:password@host:port/path/to/db.gz
+  :: FTP over SSL
+  ftps://login:password@host:port/path/to/db.gz
+
+ HTTP(S) Server 
+
+  :: HTTP without Authentication
+  http://host/path/to/database
+  :: HTTP with Authentication
+  http://user:password@host/path/to/database
+
+ SSH Server 
+
+  :: SSH with password authenication
+  scp://user:passsword@host:port/path/to/database
+
+  :: SSH with Public Key Authentication
+  scp://user@host:port/path/to/database
+
+ SSH with public key require to specify  paths for both keys in another
+ option "--import-keys". Do not set password in URL when using keys.
+
+=item B<-import-keys> | B<-keys> I<[private_key:]public_key>
+
+ Specify path to  your public key (with scp backend) or to both private 
+ and  public key (with curl backend). 
+ 
+=item B<-export> 
+
+ Option is currently not supported.
+
+=item B<-aliases|-hosts> 
+
+ Read about this option under the '-serial' option. 
+
+=item B<-fpr>
+
+ Removes all keys belonging to host from user ~/.ssh/known_hosts file.
+
+=item B<-help>
+
+ Print a brief help message and exits.
+
+=item B<-man>
+
+ Prints the manual page and exits.
+
+=item B<-version>
+ 
+ Prints the version number and author contact.
+
+=item B<-settings> 
+
+ Parsing configuration file, prints details about some settings and exits.
+
+=item B<-g> | B<-groups> I<[group1,gruop2,..,groupN]>
+
+ Without any argument return groups specified with group{} keyword on 
+ databases records or members of groups if run with argument which 
+ need to be an existing group name.
+
+=back
+
+=head1 FILES
+
+~/.bashrc | ~/.bash_profile
+
+ ASSH power is based on cooperation with gpg and gpg-agent. You need to
+ configure your shell  (bash by default) to export appropriate GPG_ and
+ SSH_ environments  variable. 
+
+ $ $EDITOR ~/.bashrc 
+
+ if [ -f "${HOME}/.gpg-agent-info" ]; 
+ then
+    . "${HOME}/.gpg-agent-info"
+    export GPG_AGENT_INFO
+    export SSH_AUTH_SOCK
+    export SSH_AGENT_PID
+ fi  
+
+ Also since version 3 assh is supporting  bash  autocompletition, which 
+ is very handy when looking for aliases or host addresses in databases. 
+ Just use your TAB.  But first you need to export appropriate function. 
+
+ $ $EDITOR ~/.bashrc 
+
+ function _getopt_complete () {
+  COMPREPLY=($( COMP_CWORD=$COMP_CWORD perl `which ${COMP_WORDS[0]}` ${COMP_WORDS[@]:0} ));
+ }
+ complete -F _getopt_complete assh
+
+ After modification  you  need to  relogin, start new session or source
+ your just edited file.
+
+ $ source ~/.bashrc 
+
+F<~/.assh/assh.conf>
+
+ Main configuration file.
+
+F<~/.assh/id_rsa_dbserver>
+
+ Default  ssh  private key for public key authentication to ssh account 
+ with remote password database. It's defined by default in config  file 
+ with dbserver_prvkey keyword. You are free to change the filename. 
+ Used with -import option.  
+
+ Keys can be generated with: 
+
+   $ ssh-keygen -t rsa -f ~/.assh/id_rsa_dbserver
+
+F<~/.assh/id_rsa_dbserver.pub>
+
+ Default ssh  public  key  for public key authentication to ssh account 
+ with  remote password database. It's defined by default in confg  file 
+ with dbserver_prvkey keyword. You are free to change the filename. 
+ Used with -import option.  
+
+ Keys can be generated with: 
+
+   $ ssh-keygen -t rsa -f ~/.assh/id_rsa_dbserver
+
+F<~/.assh/sockets/>
+
+ Used by Net::OpenSSH module. 
+
+F<~/.assh/cmdals/>
+
+ Suggested  directory for storing files  with specific command aliases.
+ There are 3 types of command aliases defined in  CMD{},  FILE{} and/or
+ CODE{} blocks in main configuration file. Last two types contains file
+ names  in  brackets {}. This  file  names contains more complex set of
+ commands.
+
+
+=head1 CONFIGURATION FILE
+
+Here will be description about assh.conf options 
+
+B<Options>
+
+# path options: set only if not found in ENV PATH
+
+ exec_gpg2  
+ exec_gpgagent  
+ exec_pinentry 
+ exec_pm
+ exec_nc
+ exec_corkscrew
+ exec_curl
+
+ # proxy options:
+
+ proxy = on|off
+ proxy_url = socks5://localhost:1080 | http://localhost:1080
+ proxy_default = config | db | cli
+ proxy_filter = ^vps|(s[1][1-5])$
+
+
+ # knock global sequence
+
+ knock_seq = 9999,8888,7777
+
+ # database server urls and additional setting 
+
+ dbserver1 = URL
+ dbserver1_prvkey = ~/.assh/id_rsa_asshdbserver 
+ dbserver1_pubkey = ~/.assh/id_rsa_asshdbserver.pub
+
+ dbserver2 = URL 
+ dbserver3 = URL
+ dbserverN = URL 
+
+ # gnupg-agent settings
+
+ # set passwords ttl for gpg agent  #  default: 3660
+ agentttl = 18000 
+
+ # set ui for pinentry [-curses | -gtk-2 | -qt | -qt4 ]
+ # try to use gtk2 or qt4 in multiterm environment 
+ # default: -curses
+ pinui = -gtk-2
+
+ #  path to your password database file 
+ #  default: ~/.assh/main.gpg
+ passwdb = ~/.assh/sxxpwd.gpg.new,~/.assh/private.gpg, #~/.assh/sa-deds.gpg
+
+ #  set your passphrase (md5) for parallel mode (just for sure)
+ #  this is not passphrase for encrypting or decrypting password database file 
+ passphrase = e6fe99feac5c8535123d5490a8226d15
+
+ #  set colors or work with mono style
+ #  default: on
+ color = off
+
+ #  use  user environments after switching between user 
+ #  su with dash (su -) or without dash (su)
+ #  default: on
+ #suenv = off
+
+
+ Settings ASSHPM
+
+ # set database encryption method, by default symetric 
+ # encryption is used, set to on to use public key cryptography
+ #  default: off
+ pubkey = on
+
+ #  set your key-id (pub)
+ #  ex. recipeint = youkeyID
+ recipient = 1B55F2DF
+
+ #  for more recipients 
+ #  ex. recipents = keyID1,keyID2,..,keyIDn
+ #recipients = LP9GXA0G,OXBS7EFM,5ZSXMM7A,8LIY9OR1
+
+ #  set symmetric algorythm
+ #  ex. cast5,twofish,blowfish,aes,aes192,aes256
+ #  default: aes256
+ cipher_algo = aes256
+
+ #  set compression algorythm 
+ #  ex. none,zlib,zip
+ #  default: zlib
+ compress_algo = Zlib
+
+
+ ASSH3 COMMAND ALIASING
+
+ defcmd::[[ $TERM == 'xterm' ]] && export PS1="\[\e]0;[\h]\a\]$PS1" 
+ 
+ # Examples: CMD{}
+ cmd_alias:echoargs:CMD{echo "cmdarg0=$CMDARG[0] , cmdarg1=$CMDARG[1]"}
+ cmd_alias:eg:CMD{exigrep $CMDARG[1] /var/log/exim/mainlog }
+ cmd_alias:ve:CMD{vzctl enter $CMDARG[1]}
+
+ # Examples: FILE{}
+ cmd_alias:ege:FILE{~/.assh/cmdals/ege.txt}
+
+ # Examples: CODE{}
+ cmd_alias:ps:CODE{~/.assh/cmdals/ps.txt}
+ 
+
+
+
+=head1 PASSWORD DATABASE FORMAT
+
+ Assh uses the password  database(s) encrypted  with  GnuPG. It  stores
+ records of servers to automate logon process. Each record is identified
+ by an alias which should be unique in database and clearly identifying
+ the server. 
+ 
+ Password database records  store  two  users  login with corresponding
+ passwords. The  first  one  is used to log into machine is an interme-
+ diary account and the second one is the destination user  account.  In
+ most cases the second account will be a root user account which should
+ be not allowed to log in directly.
+
+ 
+
+Record syntax:
+
+B<alias:host:port:user1:password1:user2:password2:extras>
+
+Colon ':' is not allowed with any field except last one - extra_args 
+
+ Fields:
+  alias      - a short name uniquly identifying server in database 
+  host       - server IP or FQDN
+  port       - SSH server port 
+  user1      - intermediary account 
+  password1  - user1 password 
+  user2      - destination account 
+  password2  - user2 password
+  extras     - this field can be a comment or special keywords 
+
+               Syntax:
+
+               key1{option};key2{option};...,keyN{option}
+
+               Keywords:
+               - socks{[bind_address:]port}
+               - local{[bind_address:]port:[host]:port}
+               - remote{[bind_address:]port:[host]:port}
+               - knock{port1,port2,..,portN}
+               - proxy{proto://host[:port]}
+               - ipv4{ip/mask,ip2/mask,ip3,ip4}
+               - ipv6{ip/mask,ip2/mask,ip3,ip4}
+
+ Example record:
+
+ sr123:192.0.2.1:1022:jsmith:psw123:root:psw321:ipv4{192.0.2.0/28};\
+   socks{1081};local{13306::3306};knock{7777,8877,7788}
+
+
+=head1 MODULES 
+
+  Net::OpenSSH                                                                
+  Expect                                                                     
+  IO::Pty, IO::Tty, IO::Stty
+  Digest::MD5                                                                
+  Term::ReadKey                                                              
+  Term::ANSIColor                                                            
+  Getopt::Complete
+
+  Optional: Net::CIDR
+
+=head1 SEE ALSO
+
+ssh(1), scp(1), curl(1), gpg(1), gpg-agent(1)
+
+=head1 LICENSE
+
+This is released under the .... 
+
+=head1 AUTHOR
+
+Bartosz Kozak L<admin@bkzk.net>
+
+
+=cut

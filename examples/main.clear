@@ -1,0 +1,7 @@
+#alias:host:port:user1:password1:user2:password2:extras
+srv01:192.0.2.1:55522:admin:psw123:root:psw321:ipv4{192.0.2.2};note{dns server};group{srv}
+srv02:192.0.2.5:55522:admin:psw123:root:psw321:ipv4{192.0.2.6};note{sql server};group{srv}
+srv03:192.0.2.17:22:admin:psw123:root:psw321:ipv4{192.0.2.16/28};note{vmm server};group{srv}
+n1-cust01:203.0.113.17:22:admin:psw123:root:psw321:note{cluster node1};group{customer1}
+n2-cust02:203.0.113.19:22:admin:psw123:root:psw321:note{cluster node2};group{customer1}
+n3-cust02:203.0.113.19:22:admin:psw123:root:psw321:
