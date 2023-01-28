@@ -1,9 +1,14 @@
-#assh
+# assh
 
-ASSH automate the login process to servers. It uses gpg-agent to store passphrase to password database file. Thanks to GnuGPG agent there is no need to enter this passphrase and passwords to servers every time you connect remotely to the server. Once you enter the passphrase it is kept by gpg-agent in memory for a certain period of time. This tool allow you to remotely login to servers without asking for a password, execute command on single or multiple servers. It also supports some of OpenSSH features like port forwarding or proxy connection and others like port knocking.
+ASSH automates the login process to UNIX servers. It uses gpg-agent to keep a passphrase to a password database file. Thanks to GnuGPG agent there is no need to enter this passphrase and passwords to servers every time the ssh client is used. Once the passphrase is provided, it is kept by gpg-agent for a certain period. You can next remotely log in to servers without being asked for a password. It allows the execution of commands on single or multiple servers and supports some OpenSSH features like port forwarding, proxy connection, and others like port knocking.
+
 
 ### Usage
 
     assh -man
 
+
+---
+
+Note: It is still a usable piece of the software, but I do not find time to maintain it anymore. It may not work as designed with the newer version of Perl and other components. 
 
